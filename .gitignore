@@ -1,0 +1,41 @@
+# ---- BMad / Claude / tooling dirs (never commit) ----
+_bmad/
+_bmad-output/
+.agents/
+.claude/
+.playwright-mcp/
+design-artifacts/
+docs/
+
+# ---- Secrets ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Local data (SQLite cache / metrics ledger) ----
+*.db
+*.sqlite
+*.sqlite3
+
+# ---- OS / editor ----
+.DS_Store
+*.swp
+.idea/
+.vscode/
