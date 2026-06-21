@@ -1,0 +1,37 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Proov">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4F46E5"/>
+      <stop offset="0.55" stop-color="#2563EB"/>
+      <stop offset="1" stop-color="#06B6D4"/>
+    </linearGradient>
+    <linearGradient id="check" x1="180" y1="200" x2="340" y2="320" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E0F2FE"/>
+    </linearGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="10" flood-color="#0B1020" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+
+  <!-- background squircle -->
+  <rect x="0" y="0" width="512" height="512" rx="112" fill="url(#bg)"/>
+
+  <!-- on-chain hexagon frame -->
+  <g stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="10" stroke-linejoin="round" fill="none">
+    <polygon points="256,118 376,187 376,325 256,394 136,325 136,187"/>
+  </g>
+  <!-- node dots at vertices -->
+  <g fill="#FFFFFF" fill-opacity="0.9">
+    <circle cx="256" cy="118" r="13"/>
+    <circle cx="376" cy="187" r="13"/>
+    <circle cx="376" cy="325" r="13"/>
+    <circle cx="256" cy="394" r="13"/>
+    <circle cx="136" cy="325" r="13"/>
+    <circle cx="136" cy="187" r="13"/>
+  </g>
+
+  <!-- bold verification checkmark -->
+  <path d="M196 262 L240 306 L322 206" stroke="url(#check)" stroke-width="38"
+        stroke-linecap="round" stroke-linejoin="round" fill="none" filter="url(#soft)"/>
+</svg>

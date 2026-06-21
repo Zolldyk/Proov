@@ -1,0 +1,35 @@
+[project]
+name = "proov"
+version = "0.1.0"
+description = "Proof-of-Verification Oracle — a paid, callable CAP agent on the CROO Agent Store."
+readme = "README.md"
+requires-python = ">=3.10"
+# LLM/search/web-framework deps arrive in Epics 2-4 — do NOT add them here yet
+# (keep the dependency surface minimal).
+dependencies = [
+    "croo-sdk",
+    # First non-croo runtime dep (Story 1.4). Provides real Ethereum keccak256 for the
+    # on-chain receipt — `hashlib.sha3_256` is NIST SHA3, a DIFFERENT digest, and would
+    # silently fail to match CAP's Base anchor. pycryptodome is a single pure package
+    # (ships 3.13 wheels) and pulls in NO Ethereum stack.
+    "pycryptodome>=3.20",
+]
+
+[project.optional-dependencies]
+# Test-only deps — install with: pip install -e ".[test]". Not shipped at runtime.
+test = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# Source layout established in Story 1.2. Only the `[A]` provider adapter + config + entrypoint
+# live here for now; engine/LLM/search/cache (Epic 2+) extend this tree later.
+packages = ["proov"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
