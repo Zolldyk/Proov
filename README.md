@@ -170,6 +170,49 @@ PROOV_SEARCH_PROVIDER=          # force a single `wikipedia|tavily|stub`; unset 
 PROOV_SEARCH_TIMEOUT=10         # per-call (per-claim) timeout in seconds (garbage falls back to 10)
 ```
 
+### Per-claim judgment
+
+Judge each claim against its retrieved evidence. `proov/types.py` gains the `ClaimStatus`/
+`Stance`/`EvidenceStance`/`Judgment` types and the `clamp_confidence` helper; `proov/llm.py`
+extends the **same** `LLMProvider` interface with a second method, `judge_claim`, implemented
+by both providers, plus the top-level `judge_claim` entrypoint.
+
+- **Same LLM, no new config.** Judgment reuses the *same* pluggable `LLMProvider` (Gemini) and
+  the *same* env as extraction (`PROOV_LLM_PROVIDER`, `PROOV_LLM_MODEL`,
+  `GEMINI_API_KEY`/`GOOGLE_API_KEY`, `PROOV_LLM_TIMEOUT`) — **no new environment variable**.
+  The Gemini judge call sends the key in the `x-goog-api-key` header and asks for a structured
+  JSON object.
+- **Labels.** Each claim is labelled `supported` / `unsupported` / `unverifiable` with a
+  per-claim confidence in `[0,1]` and the supporting/refuting `evidence` (`{source, quote, stance}`).
+- **Precision over recall (never a guess).** A judged evidence item is kept only if its `source`
+  was actually retrieved (a fabricated source is dropped), and a `supported`/`unsupported` label
+  with no surviving grounded evidence is downgraded to `unverifiable`. When evidence is thin —
+  or the judge call fails — the claim degrades to `unverifiable` rather than risking a confident
+  wrong verdict; one claim's failure never crashes a multi-claim order.
+
+### Citation check (Story 2.4)
+
+When a buyer supplies `sources` with their output, `proov/citations.py` checks each provided
+source and flags it `ok` / `fabricated` / `misattributed` for the `citations_checked[]` field.
+This is the **provided-sources-only** path (Quick); Deep's "discovered sources" check is
+Story 2.7.
+
+- **Two signals, one fetch.** Retrievability is a small injectable `httpx` GET of the source
+  URL (status < 400, redirects followed); the fetched, HTML-stripped body doubles as the
+  evidence for a support judgment that **reuses the same `LLMProvider`** as extraction and
+  per-claim judgment (via `judge_claim`) — **no new LLM config, no new LLM interface**. The
+  output is the source's synthetic "attached claim".
+- **Flags.** `ok` (retrievable and supports the output, or support merely unconfirmed),
+  `fabricated` (NOT retrievable), `misattributed` (retrievable but positively refuted).
+- **Precision over recall (never cry wolf).** `fabricated` fires **only** on a confirmed
+  unretrievable source (it is the verdict-flipping flag the Story 2.5 `fail` rule keys on),
+  and `misattributed` **only** on a positive `unsupported` judgment — mere uncertainty
+  (`unverifiable`, or content we couldn't read) is `ok` with support left unconfirmed. The
+  check **never crashes a paid order**: a bad source degrades to a conservative non-fabricated
+  `ok`, not a false `fabricated`.
+- **Config.** One new optional env var, `PROOV_CITATION_TIMEOUT` (seconds, default 10), bounds
+  the per-source fetch; support reuses the existing LLM env. No new dependency.
+
 ## Input/output contract
 
 The submitted input is the negotiation's `requirements` JSON string:

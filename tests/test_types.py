@@ -16,6 +16,9 @@ from proov.types import (
     QUICK_MAX_CLAIMS,
     Claim,
     Evidence,
+    EvidenceStance,
+    Judgment,
+    clamp_confidence,
     evidence_k_for_tier,
     max_claims_for_tier,
 )
@@ -112,3 +115,51 @@ def test_evidence_k_missing_option_is_ignored():
 
 def test_evidence_k_unknown_tier_defaults_to_quick():
     assert evidence_k_for_tier("nonsense") == 3  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------- EvidenceStance / Judgment
+
+
+def test_evidence_stance_is_frozen():
+    es = EvidenceStance(source="https://x", quote="q", stance="supports")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        es.quote = "mutated"  # type: ignore[misc]
+
+
+def test_judgment_is_frozen_and_hashable():
+    j = Judgment(status="supported", confidence=0.9)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        j.status = "unsupported"  # type: ignore[misc]
+    # tuple evidence keeps Judgment hashable like Claim/Evidence.
+    assert hash(j) == hash(Judgment(status="supported", confidence=0.9))
+
+
+def test_judgment_evidence_defaults_to_empty_tuple():
+    j = Judgment(status="unverifiable", confidence=0.0)
+    assert j.evidence == ()
+    assert isinstance(j.evidence, tuple)
+
+
+# --------------------------------------------------------------------------- clamp_confidence
+
+
+def test_clamp_confidence_passes_through_mid_range():
+    assert clamp_confidence(0.5) == 0.5
+
+
+def test_clamp_confidence_clamps_both_ends():
+    assert clamp_confidence(1.5) == 1.0
+    assert clamp_confidence(-1) == 0.0
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan"), "x", None, True, False])
+def test_clamp_confidence_rejects_non_finite_bool_and_non_numeric(bad):
+    assert clamp_confidence(bad) == 0.0
+
+
+def test_clamp_confidence_always_returns_float():
+    # 0 vs 0.0 canonicalise to different bytes when hashed (Story 2.6) — must be float.
+    result = clamp_confidence(0)
+    assert type(result) is float
+    assert result == 0.0
+    assert type(clamp_confidence(1)) is float

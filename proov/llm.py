@@ -6,19 +6,23 @@ provider requires no engine changes (interface honored)."* So everything here ha
 structural `LLMProvider` Protocol + a `get_llm_provider` factory; the only code that names
 a concrete provider class is the factory.
 
-Story 2.1 ships:
-- `LLMProvider` — `@runtime_checkable` Protocol declaring ONLY `extract_claims`
-  (`judge_claim` is Story 2.3; Protocols are structural so 2.3 can extend without breaking
-  this).
+This module ships:
+- `LLMProvider` — `@runtime_checkable` Protocol declaring BOTH `extract_claims` (Story 2.1)
+  and `judge_claim` (Story 2.3). Protocols are structural, so a provider qualifies by
+  implementing both; the engine depends only on the Protocol + the factory.
 - `LLMError` — typed call-failure the engine's Story 1.5 graceful wrapper catches.
-- `GeminiProvider` — primary, real async REST call to Gemini 2.5 Flash via `httpx` with
-  structured-JSON output. Key sent via `x-goog-api-key` header (never `?key=`), and
-  `register_secret`-ed so it can never leak into a log.
+- `GeminiProvider` — primary, real async REST calls to Gemini 2.5 Flash via `httpx` with
+  structured-JSON output (a STRING array for extraction, an OBJECT for judgment). Key sent
+  via `x-goog-api-key` header (never `?key=`), and `register_secret`-ed so it can never leak.
 - `StubLLMProvider` — deterministic offline provider (zero network, zero API spend) for
   tests and the `$0` path.
+- `_normalise_claims` / `_normalise_judgment` — the single normalisation seams every provider
+  routes through (the judgment seam enforces source-grounding + the anti-guess calibration).
 - `get_llm_provider` — factory resolving the provider from `PROOV_LLM_PROVIDER`.
-- `extract_claims` — provider-agnostic top-level entrypoint the engine (Story 2.6) calls;
-  honours the PRD §6 explicit-`claims` bypass and the tier caps.
+- `extract_claims` / `judge_claim` — provider-agnostic top-level entrypoints the engine
+  (Story 2.6) calls. Note the deliberate failure-model contrast: `extract_claims` raises
+  `LLMError` out (the whole order has nothing to verify), but `judge_claim` degrades a single
+  claim to `unverifiable` and NEVER raises out (one claim's failure can't kill an order).
 
 No `croo` import — this is engine `[B]`/`[C]` code, off the SDK-coupled path.
 """
@@ -34,7 +38,17 @@ from typing import Protocol, runtime_checkable
 import httpx
 
 from .redaction import register_secret
-from .types import Claim, Tier, max_claims_for_tier
+from .types import (
+    Claim,
+    ClaimStatus,
+    Evidence,
+    EvidenceStance,
+    Judgment,
+    Stance,
+    Tier,
+    clamp_confidence,
+    max_claims_for_tier,
+)
 
 logger = logging.getLogger("proov.llm")
 
@@ -53,6 +67,52 @@ _EXTRACTION_PROMPT = (
     "first. If there are no checkable factual claims, return an empty array.\n\nTEXT:\n{text}"
 )
 
+# Bounds each judged quote (payload/cost) — judged quotes are short extracts, not the full
+# (1000-char-bounded) retrieved snippet. Used by both the Stub and `_normalise_judgment`.
+_MAX_QUOTE_CHARS = 300
+
+# Judge prompt — structured OBJECT output. The model is told to cite ONLY from the numbered
+# evidence (by its source URL) and to favour precision over recall: return `unverifiable`
+# rather than guess when the evidence is insufficient (PRD §1 quality bar / NFR4).
+_JUDGMENT_PROMPT = (
+    "Judge the following CLAIM against the numbered EVIDENCE. Label it exactly one of "
+    "\"supported\", \"unsupported\", or \"unverifiable\". Give a confidence between 0 and 1. "
+    "Cite ONLY from the numbered evidence below, by its exact source URL, with a short "
+    "verbatim quote and a stance of \"supports\", \"refutes\", or \"neutral\". Do NOT invent "
+    "sources. Favour precision over recall: if the evidence is thin, conflicting, or "
+    "insufficient to decide, return \"unverifiable\" rather than guessing. Respond as a JSON "
+    "object {{\"status\", \"confidence\", \"evidence\": [{{\"source\", \"quote\", \"stance\"}}]}}."
+    "\n\nCLAIM:\n{claim}\n\nEVIDENCE:\n{evidence}"
+)
+
+# JSON OBJECT schema for the judge's structured output (mirrors the extraction schema's
+# uppercase-type convention). The judge returns an object, not extraction's ARRAY of STRING.
+_JUDGMENT_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "status": {"type": "STRING"},
+        "confidence": {"type": "NUMBER"},
+        "evidence": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "source": {"type": "STRING"},
+                    "quote": {"type": "STRING"},
+                    "stance": {"type": "STRING"},
+                },
+            },
+        },
+    },
+}
+
+# Cosmetic deterministic confidence for the offline Stub judge (any fixed value in [0,1]).
+_STUB_JUDGE_CONFIDENCE = 0.5
+
+# Closed coercion sets for `_normalise_judgment` (anything else falls back to the safe value).
+_VALID_STATUSES: frozenset[str] = frozenset(("supported", "unsupported", "unverifiable"))
+_VALID_STANCES: frozenset[str] = frozenset(("supports", "refutes", "neutral"))
+
 
 class LLMError(RuntimeError):
     """A real LLM call failure (transport / HTTP status / timeout / config).
@@ -67,12 +127,15 @@ class LLMError(RuntimeError):
 class LLMProvider(Protocol):
     """Structural interface every LLM provider satisfies.
 
-    Declares ONLY `extract_claims` for now. `judge_claim` is Story 2.3 — do not add it
-    here. Because this is a `@runtime_checkable` Protocol, conformance is proven by a cheap
-    `isinstance` test and a future provider need only implement this method.
+    Declares BOTH halves of the engine's LLM work: `extract_claims` (Story 2.1) and
+    `judge_claim` (Story 2.3). Because this is a `@runtime_checkable` Protocol, conformance
+    is proven by a cheap `isinstance` test — so a provider MUST implement both methods to
+    qualify, and a future provider drops in with no engine change once it does.
     """
 
     async def extract_claims(self, text: str, max_claims: int) -> list[Claim]: ...
+
+    async def judge_claim(self, claim: Claim, evidence: list[Evidence]) -> Judgment: ...
 
 
 def _normalise_claims(raw: list[str], max_claims: int) -> list[Claim]:
@@ -102,6 +165,56 @@ def _normalise_claims(raw: list[str], max_claims: int) -> list[Claim]:
     return claims
 
 
+def _normalise_judgment(raw: dict, evidence: list[Evidence]) -> Judgment:
+    """Coerce a raw judge result into a contract-honouring, source-grounded `Judgment`.
+
+    The SINGLE seam every provider (Stub included) routes through, so the precision-over-recall
+    guarantee holds uniformly — mirroring how `_normalise_claims` is the one seam for extraction:
+
+    - `status` is coerced into `ClaimStatus`; an unknown/missing value → `"unverifiable"`.
+    - `confidence` goes through `clamp_confidence` (always a float in `[0,1]`).
+    - **Source-grounding (anti-fabrication):** a judged evidence item is kept ONLY if its
+      `source` matches a `source` present in the input `evidence`. A judge-invented source is
+      dropped — we never surface a citation we did not actually retrieve. `stance` is coerced
+      into `Stance` (unknown → `"neutral"`); `quote` is trimmed, dropped if blank, and bounded
+      to `_MAX_QUOTE_CHARS`; an item with a blank `source` is dropped.
+    - **Label-needs-evidence (anti-guess):** a `supported`/`unsupported` label with NO surviving
+      grounded evidence is downgraded to `"unverifiable"` — we do not assert a confident label
+      backed by nothing (PRD §1 "say unverifiable rather than risk a confident wrong verdict").
+    """
+    allowed_sources = {e.source for e in evidence}
+
+    status = raw.get("status")
+    if status not in _VALID_STATUSES:
+        status = "unverifiable"
+
+    confidence = clamp_confidence(raw.get("confidence"))
+
+    grounded: list[EvidenceStance] = []
+    raw_evidence = raw.get("evidence")
+    raw_evidence = raw_evidence if isinstance(raw_evidence, list) else []
+    for item in raw_evidence:
+        if not isinstance(item, dict):
+            continue
+        source = item.get("source")
+        if not isinstance(source, str) or source not in allowed_sources:
+            continue  # blank or fabricated source → drop (anti-fabrication grounding).
+        quote_raw = item.get("quote")
+        quote = quote_raw.strip()[:_MAX_QUOTE_CHARS] if isinstance(quote_raw, str) else ""
+        if not quote:
+            continue
+        stance = item.get("stance")
+        if stance not in _VALID_STANCES:
+            stance = "neutral"
+        grounded.append(EvidenceStance(source=source, quote=quote, stance=stance))
+
+    # Calibration guard: a positive/negative label must be backed by ≥1 real evidence item.
+    if status in {"supported", "unsupported"} and not grounded:
+        status = "unverifiable"
+
+    return Judgment(status=status, confidence=confidence, evidence=tuple(grounded))
+
+
 class StubLLMProvider:
     """Deterministic, offline `LLMProvider` — zero network, zero API spend.
 
@@ -124,6 +237,28 @@ class StubLLMProvider:
         # Strip trailing sentence punctuation so the claim text reads cleanly.
         cleaned = [p.strip().rstrip(".!?").strip() for p in pieces]
         return _normalise_claims(cleaned, max_claims)
+
+    async def judge_claim(self, claim: Claim, evidence: list[Evidence]) -> Judgment:
+        # No evidence → unverifiable (don't judge with nothing to judge) — same honest
+        # outcome the real provider and the top-level entrypoint produce for thin evidence.
+        if not evidence:
+            return Judgment("unverifiable", 0.0, ())
+        # Deterministic offline verdict: every piece of evidence "supports" with a fixed
+        # confidence. Route through `_normalise_judgment` so the Stub honours the SAME
+        # grounding/calibration guards as the real provider (one code path).
+        raw = {
+            "status": "supported",
+            "confidence": _STUB_JUDGE_CONFIDENCE,
+            "evidence": [
+                {
+                    "source": e.source,
+                    "quote": e.snippet[:_MAX_QUOTE_CHARS],
+                    "stance": "supports",
+                }
+                for e in evidence
+            ],
+        }
+        return _normalise_judgment(raw, evidence)
 
 
 class GeminiProvider:
@@ -201,6 +336,63 @@ class GeminiProvider:
             return []
         return _normalise_claims(parsed, max_claims)
 
+    async def judge_claim(self, claim: Claim, evidence: list[Evidence]) -> Judgment:
+        # Empty evidence short-circuits to unverifiable with NO network call — don't judge
+        # (and don't spend) with nothing to judge.
+        if not evidence:
+            return Judgment("unverifiable", 0.0, ())
+
+        numbered = "\n".join(
+            f"{i}. [{e.source}] {e.snippet}" for i, e in enumerate(evidence, start=1)
+        )
+        body = {
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "text": _JUDGMENT_PROMPT.format(
+                                claim=claim.text, evidence=numbered
+                            )
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "responseSchema": _JUDGMENT_SCHEMA,
+            },
+        }
+        # Key in the header, NEVER the URL — same as extract_claims; reuses the same key.
+        url = _GEMINI_ENDPOINT.format(model=self._model)
+        headers = {"x-goog-api-key": self._api_key}
+
+        try:
+            if self._client is not None:
+                response = await self._client.post(url, json=body, headers=headers)
+            else:
+                async with httpx.AsyncClient(timeout=self._timeout) as client:
+                    response = await client.post(url, json=body, headers=headers)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            # Transport / status / timeout — a real failure. Raise typed so the top-level
+            # `judge_claim` entrypoint can log the real reason and degrade this ONE claim to
+            # unverifiable. Do NOT let an outage masquerade as a confident unverifiable here.
+            raise LLMError(f"Gemini judge_claim call failed: {exc!r}") from exc
+
+        # A successful 200 whose body is unparseable / shape-less is the VALID-empty judgment
+        # `unverifiable` (a logged warning, not an exception) — the same LLMError-vs-empty
+        # split `extract_claims` uses, with `unverifiable` playing the role `[]` plays there.
+        try:
+            payload = response.json()
+            candidate_text = payload["candidates"][0]["content"]["parts"][0]["text"]
+            parsed = json.loads(candidate_text)
+            if not isinstance(parsed, dict):
+                raise ValueError("candidate text is not a JSON object")
+        except (KeyError, IndexError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            logger.warning("Gemini returned an unparseable/shape-less judgment: %r", exc)
+            return Judgment("unverifiable", 0.0, ())
+        return _normalise_judgment(parsed, evidence)
+
 
 def get_llm_provider(name: str | None = None) -> LLMProvider:
     """Resolve an `LLMProvider` by name (the only place concrete classes are named).
@@ -266,3 +458,36 @@ async def extract_claims(
             return normalised
     active = provider if provider is not None else get_llm_provider()
     return await active.extract_claims(text, cap)
+
+
+async def judge_claim(
+    claim: Claim,
+    evidence: list[Evidence],
+    tier: Tier,
+    *,
+    provider: LLMProvider | None = None,
+    options: dict | None = None,
+) -> Judgment:
+    """Provider-agnostic per-claim judgment entrypoint (the engine, Story 2.6, calls this).
+
+    Deliberately UNLIKE `extract_claims`, which raises `LLMError` out: judgment is per-claim,
+    and the Story 2.6 engine judges many claims in a loop, so one claim's judge failure must
+    NOT nuke a paid multi-claim order. Thin evidence and a failed call therefore BOTH resolve
+    to the same honest `unverifiable` — this entrypoint **never raises out** (degrade, don't
+    drop — NFR3):
+
+    - empty `evidence` → `Judgment("unverifiable", 0.0, ())` with NO provider call;
+    - otherwise delegate to `provider` (or the `get_llm_provider()` default); if the provider
+      raises `LLMError`, log a warning and degrade THIS claim to `unverifiable`.
+
+    `tier`/`options` are accepted for the Story 2.7 Deep multi-pass (self-consistency) seam;
+    the judge is single-pass in this story (architecture §4: Quick single-pass, Deep multi-pass).
+    """
+    if not evidence:
+        return Judgment("unverifiable", 0.0, ())
+    active = provider if provider is not None else get_llm_provider()
+    try:
+        return await active.judge_claim(claim, list(evidence))
+    except LLMError as exc:
+        logger.warning("judge_claim degraded to unverifiable after provider failure: %r", exc)
+        return Judgment("unverifiable", 0.0, ())
