@@ -229,6 +229,7 @@ class ProviderAdapter:
         from croo import DeliverableType, DeliverOrderRequest
 
         from . import deliverable as deliverable_mod
+        from . import engine as engine_mod
         from .deliverable import build_graceful_deliverable
         from .receipt import canonical_json
         from .services import tier_for_service
@@ -263,10 +264,18 @@ class ProviderAdapter:
             # `output_text` feeds the receipt's `output_hash` (Story 1.4).
             output_text = result.value["output"]
             # Graceful-degrade seam (AC4): the verification/build step is the only thing
-            # wrapped here. Today it builds the stub; the Epic 2 `verify()` plugs in here.
-            # On an internal error we deliver an honest `unverifiable` report (degrade,
-            # don't drop) rather than letting the order fall to an SLA timeout. Resolve the
-            # builder via the module so a monkeypatched build is honoured.
+            # wrapped here. Story 2.6 plugs the REAL engine in here — `engine.verify` runs the
+            # full single-pass pipeline over the whole validated input (`result.value` carries
+            # `sources`/`claims`/`options`, not just `output`), then `build_deliverable` maps
+            # the `Report` into the real PRD §6 body + real receipt. Both are resolved via the
+            # module so a monkeypatched engine/builder is honoured in tests.
+            #
+            # `verify` itself "never raises out" (it degrades internally to a real `partial`),
+            # so the inner `except` is now belt-and-suspenders — but keep it: a programming
+            # error in `build_deliverable` itself (or a broken `verify`) must still degrade
+            # rather than drop a paid order. On an internal error we deliver an honest
+            # `unverifiable` report (degrade, don't drop) rather than letting the order fall to
+            # an SLA timeout.
             #
             # The graceful fallback build AND the canonical serialisation are wrapped
             # together: if the DEGRADE build itself fails (it shares the badge/receipt/
@@ -277,8 +286,9 @@ class ProviderAdapter:
             # (escrow auto-refunds the requester), exactly like the malformed-input path.
             try:
                 try:
-                    payload = deliverable_mod.build_stub_deliverable(
-                        order, tier, output_text=output_text
+                    report = await engine_mod.verify(result.value, tier)
+                    payload = deliverable_mod.build_deliverable(
+                        order, tier, output_text=output_text, report=report
                     )
                 except Exception as build_exc:
                     logger.exception(

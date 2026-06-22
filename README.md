@@ -11,11 +11,13 @@ A paid, callable CAP agent that verifies the factual claims in an AI-generated o
 ## Status
 
 The CAP transaction path (negotiate → pay → deliver → settle), the tamper-evident on-chain
-receipt, input validation and graceful degrade, and the pluggable claim-extraction and
-evidence-retrieval layers are built and tested. The per-claim judgment and verdict
-aggregation that turn retrieved evidence into a final verdict are in active development, so
-deliveries currently return an honest `unverifiable` verdict with a fully populated,
-independently verifiable receipt.
+receipt, input validation and graceful degrade, and the full verification engine —
+claim extraction, evidence retrieval, per-claim judgment, citation check and deterministic
+verdict aggregation — are built and tested. As of Story 2.6 the **Quick Check** path runs
+the whole engine end-to-end: a paid Quick order is verified single-pass and delivered as a
+real, schema-valid JSON deliverable whose `verdict`/`confidence`/`claims`/`citations_checked`/
+`stats` are the actual aggregated result, with the real model id in a fully populated,
+independently verifiable receipt. The Deep Verify (multi-pass) path is the next story.
 
 ## How it works
 
@@ -23,7 +25,7 @@ A caller submits an AI-generated `output` (optionally with `claims` and `sources
 
 1. **Extracts** discrete, checkable factual claims from the output (pluggable LLM).
 2. **Retrieves** real, source-linked evidence for each claim (pluggable search).
-3. **Judges** each claim against its evidence and **aggregates** a verdict *(in development)*.
+3. **Judges** each claim against its evidence and **aggregates** a deterministic verdict.
 4. **Delivers** a schema-valid result whose `receipt` is anchored on Base mainnet, so anyone
    can re-hash the deliverable and confirm it on-chain.
 
@@ -213,6 +215,60 @@ Story 2.7.
 - **Config.** One new optional env var, `PROOV_CITATION_TIMEOUT` (seconds, default 10), bounds
   the per-source fetch; support reuses the existing LLM env. No new dependency.
 
+### Deterministic verdict (Story 2.5)
+
+`proov/verdict.py` rolls the per-claim judgments (2.3) and per-source citation checks (2.4)
+into a single aggregate `Verdict` — one `pass` / `fail` / `partial` label, an overall
+confidence, and the PRD §6 `stats` counts `{claims_total, supported, unsupported, unverifiable}`.
+Unlike the network slices above, this module is **pure and synchronous** (no `croo`, no `httpx`,
+no async, no clock/RNG/env) — its template is `proov/receipt.py`.
+
+- **The FR10 rule** (evaluated in this precedence order):
+  - `fail` = ≥1 `fabricated` citation **or** ≥1 `unsupported` (refuted) claim.
+  - `pass` = ≥1 claim, **all** `supported`, **no** `fabricated` citation, **no** `unverifiable`
+    claim.
+  - `partial` = everything else — including zero claims or any `unverifiable` claim (precision
+    over recall: `pass` is reserved for a positively-verified output, never asserted on an
+    empty or uncertain run).
+- **Misattributed citations have no v1 verdict effect** (Open Question 1, literal FR10): only
+  `fabricated` gates the label; a `misattributed` source alongside all-`supported` claims still
+  yields `pass`. The precision-safe partial-demote alternative is a Story 3.1 calibration question.
+- **Deterministic = load-bearing.** The verdict and confidence are hashed into the on-chain
+  receipt (Story 2.6 / CAP anchoring), so `aggregate_verdict` is a pure function of its inputs
+  (same inputs ⇒ same bytes): the label uses commutative counting and the confidence is computed
+  in stable list order.
+- **Confidence (v1)** is the mean of the per-claim confidences (a clamped `float`, `0.0` for
+  zero claims); the calibrated evidence-agreement + coverage formula is deferred to **Story 3.1**.
+- **Wiring** the `Verdict` into the delivered `verdict` / `confidence` / `stats` fields is
+  **Story 2.6** (Quick Check end-to-end); this slice only produces the value. No new dependency,
+  no new env var.
+
+### Quick Check end-to-end (Story 2.6)
+
+`proov/engine.py` is the SDK-agnostic `[B]` Verification Engine that finally ties the five
+slices above together: `verify(input, tier) -> Report` runs the full single-pass pipeline —
+**extract claims → (per claim) retrieve evidence + judge → check citations → aggregate
+verdict** — and the new `build_deliverable` (`proov/deliverable.py`) maps the resulting
+`Report` into a real PRD §6 deliverable + a real receipt. After this story a paid **Quick**
+order returns a *real* `pass`/`fail`/`partial` verdict with confidence, a per-claim evidence
+trail, citation flags, stats and a tamper-evident on-chain receipt — no longer the stub.
+
+- **Single-pass, sequential.** v1 judges claims one at a time in extraction order (simplest,
+  deterministic, and within the free-tier LLM RPM ceiling). Bounded-concurrency / a worker
+  pool is **Story 3.3**; the Deep multi-pass tier is **Story 2.7**.
+- **Per-order SLA budget → honest early-stop.** A per-order deadline (`PROOV_QUICK_SLA_SECONDS`,
+  default 240s — under the 5-min Quick SLA) is checked before each claim; if it is exceeded the
+  loop stops early and aggregates whatever was judged into a real **`partial`** (degrade, don't
+  drop — NFR3), never a thrown error or an SLA timeout.
+- **Real model id (FR14).** The receipt now stamps the active LLM provider's model id
+  (`gemini-2.5-flash`, or `stub-llm` offline) instead of the old `stub-no-engine` placeholder —
+  the engine resolves the provider once and injects it into both extraction and judgment so the
+  stamped model is provably the one that judged.
+- **Never raises out.** The engine degrades internally (an extraction failure → zero claims →
+  `partial`; the other four slices are already total), so the provider's graceful/reject seam is
+  only a belt-and-suspenders backstop. No new dependency; one new env var
+  (`PROOV_QUICK_SLA_SECONDS`).
+
 ## Input/output contract
 
 The submitted input is the negotiation's `requirements` JSON string:
@@ -349,7 +405,7 @@ new runtime dependency, no I/O.
 { "issuer": "Proov",
   "schema": "proov.verified-by-proov.v1",
   "version": "0.1.0",
-  "verdict": "unverifiable", "confidence": 0.0, "model": "stub-no-engine",
+  "verdict": "pass", "confidence": 0.0, "model": "gemini-2.5-flash",
   "timestamp": "…Z",
   "output_hash": "0x…", "report_hash": "0x…",
   "anchor_ref": { "chain": "base-mainnet", "mechanism": "cap-deliver-keccak256", "anchor_field": "content_hash" },

@@ -41,6 +41,19 @@ def _cfg() -> AppConfig:
     )
 
 
+@pytest.fixture(autouse=True)
+def _offline_engine(monkeypatch):
+    """Force the deterministic stub LLM + stub search so the wired engine runs $0/offline.
+
+    As of Story 2.6 a paid order runs the real `engine.verify`; without this the engine
+    would resolve the live Gemini provider (no key → degrade) and the keyless Wikipedia
+    search fallback (a live HTTP call). Pinning both to the stubs keeps the suite offline
+    (NFR1) and makes the happy path deliver a real, deterministic `pass` verdict.
+    """
+    monkeypatch.setenv("PROOV_LLM_PROVIDER", "stub")
+    monkeypatch.setenv("PROOV_SEARCH_PROVIDER", "stub")
+
+
 class FakeEventStream:
     """Records handler registrations; exposes a settable err() and async close()."""
 
@@ -220,8 +233,12 @@ async def test_order_paid_fetches_and_delivers_schema():
     # Delivered as a SCHEMA with a JSON-parseable payload conforming to PRD §6.
     assert req.deliverable_type == DeliverableType.SCHEMA
     payload = json.loads(req.deliverable_schema)
-    assert payload["verdict"] == "unverifiable"
+    # Story 2.6: the real engine now delivers a real verdict. The sample output
+    # ("Paris is the capital of France.") extracts one claim the stub judges `supported`
+    # → `pass` (no longer the stub `unverifiable`).
+    assert payload["verdict"] == "pass"
     assert "summary" in payload and "receipt" in payload
+    assert payload["stats"].get("degraded") is None  # a real run, not a degrade
 
 
 async def test_order_paid_fetches_negotiation_and_populates_receipt():
@@ -240,7 +257,9 @@ async def test_order_paid_fetches_negotiation_and_populates_receipt():
     # Receipt is populated (not the Story 1.3 `{}`), and output_hash == keccak256(output).
     assert receipt != {}
     assert receipt["output_hash"] == keccak256_hex(_SAMPLE_OUTPUT.encode("utf-8"))
-    assert receipt["model"] == "stub-no-engine"
+    # Story 2.6: the receipt now stamps the REAL model id (the stub engine's honest id),
+    # never the old `stub-no-engine` placeholder.
+    assert receipt["model"] == "stub-llm"
 
 
 async def test_delivered_payload_lets_a_verifier_reproduce_report_hash():
@@ -387,14 +406,15 @@ async def test_order_paid_valid_input_delivers_as_before():
 
 
 async def test_order_paid_degrades_gracefully_when_build_raises(monkeypatch):
-    # AC4: when the verification/build step raises, the order is NOT dropped — Proov
-    # delivers a graceful `unverifiable` deliverable so the order still completes.
-    import proov.deliverable as deliverable_mod
+    # AC4/Story 2.6: `verify` "never raises out", so the inner except is belt-and-suspenders.
+    # If the engine DOES raise (a programming error despite the contract), the order is NOT
+    # dropped — Proov delivers a graceful `unverifiable` deliverable so the order completes.
+    import proov.engine as engine_mod
 
     def _boom(*_a, **_k):
         raise RuntimeError("verify exploded")
 
-    monkeypatch.setattr(deliverable_mod, "build_stub_deliverable", _boom)
+    monkeypatch.setattr(engine_mod, "verify", _boom)
 
     stream = FakeEventStream()
     client = FakeClient(stream)
@@ -423,11 +443,14 @@ async def test_order_paid_rejects_terminally_when_even_graceful_build_fails(monk
     # outer except's discard-and-retry (poison-message loop). The honest terminal action is
     # reject_order (escrow refunds), and a re-emit must not retry the same failure.
     import proov.deliverable as deliverable_mod
+    import proov.engine as engine_mod
 
     def _boom(*_a, **_k):
         raise RuntimeError("build exploded")
 
-    monkeypatch.setattr(deliverable_mod, "build_stub_deliverable", _boom)
+    # Story 2.6 seam: the engine raises (inner try), AND the graceful backstop also raises
+    # (its deterministic fault) → outer except → reject_order.
+    monkeypatch.setattr(engine_mod, "verify", _boom)
     monkeypatch.setattr(deliverable_mod, "build_graceful_deliverable", _boom)
 
     stream = FakeEventStream()

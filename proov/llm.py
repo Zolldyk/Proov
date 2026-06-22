@@ -133,6 +133,11 @@ class LLMProvider(Protocol):
     qualify, and a future provider drops in with no engine change once it does.
     """
 
+    # The active model id (FR14) — the engine (Story 2.6) reads this off the resolved
+    # provider and stamps it into the receipt, so it must be a public attribute on every
+    # provider. Gemini → its configured model (e.g. "gemini-2.5-flash"); Stub → "stub-llm".
+    model: str
+
     async def extract_claims(self, text: str, max_claims: int) -> list[Claim]: ...
 
     async def judge_claim(self, claim: Claim, evidence: list[Evidence]) -> Judgment: ...
@@ -223,6 +228,11 @@ class StubLLMProvider:
     burning Gemini quota (NFR1).
     """
 
+    # Honest model id (FR14): a real engine ran, but NOT Gemini — distinct from the old
+    # deliverable placeholder `stub-no-engine` (which meant *no* engine ran at all). The
+    # engine stamps this into the receipt for an offline/stub verification.
+    model = "stub-llm"
+
     async def extract_claims(self, text: str, max_claims: int) -> list[Claim]:
         # Split on sentence-ending punctuation; `_normalise_claims` handles trim/dedupe/cap.
         pieces: list[str] = []
@@ -278,7 +288,11 @@ class GeminiProvider:
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._api_key = api_key
+        # Public per FR14: the engine (Story 2.6) reads `.model` off the resolved provider
+        # and stamps it into the receipt. `_model` stays as the internal name the REST calls
+        # use; `model` is the public contract the `LLMProvider` Protocol declares.
         self._model = model
+        self.model = model
         self._timeout = timeout
         self._client = client
         # The Gemini key is NOT `croo_sk_`-shaped, so the standing redaction filter won't

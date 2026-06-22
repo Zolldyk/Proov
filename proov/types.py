@@ -6,10 +6,13 @@ module is its type vocabulary. It mirrors the pure style of `proov/receipt.py` /
 logging side-effects. Only stdlib.
 
 Story 2.1 established the first slice (`Claim`, `Tier`, claim caps, `max_claims_for_tier`);
-Story 2.2 added `Evidence`/evidence caps; Story 2.3 adds the judgment vocabulary
-(`ClaimStatus`, `Stance`, `EvidenceStance`, `Judgment`, `clamp_confidence`). The `Report`
-aggregate type (Story 2.5) lands here later. The pure constraint holds throughout: stdlib
-only (`math` for the confidence clamp), no `croo`, no `httpx`, no I/O.
+Story 2.2 added `Evidence`/evidence caps; Story 2.3 added the judgment vocabulary
+(`ClaimStatus`, `Stance`, `EvidenceStance`, `Judgment`, `clamp_confidence`); Story 2.4 added
+the citation-check vocabulary (`CitationFlag`, `CitationCheck`); Story 2.5 added the aggregate
+verdict vocabulary (`VerdictLabel`, `Verdict`); Story 2.6 adds the single-pass engine result
+vocabulary (`ClaimFinding`, `Report`) the `[B]` engine returns and the deliverable builder
+maps. The pure constraint holds throughout: stdlib only (`math` for the confidence clamp),
+no `croo`, no `httpx`, no I/O.
 """
 
 from __future__ import annotations
@@ -40,6 +43,14 @@ Stance = Literal["supports", "refutes", "neutral"]
 # `fabricated` fires only on a confirmed-unretrievable source, `misattributed` only on a
 # positive `unsupported` judgment — never on mere uncertainty.
 CitationFlag = Literal["ok", "fabricated", "misattributed"]
+
+# The aggregate verdict label (Story 2.5 / PRD §6 `verdict`). This is EXACTLY the PRD §6
+# `verdict` enum — `pass | fail | partial` and nothing else. `"unverifiable"` is
+# deliberately NOT a member: that is the *degrade* verdict produced by
+# `build_graceful_deliverable` on engine error, never an output of `aggregate_verdict`
+# (`proov.verdict`). The deterministic FR10 rule maps judged claims + citation checks onto
+# one of these three labels (`fail` > `partial` > `pass` by precedence).
+VerdictLabel = Literal["pass", "fail", "partial"]
 
 # Per-tier claim caps (FR6 / PRD §6 / epic 2.1 AC): Quick = 20, Deep = default 50.
 QUICK_MAX_CLAIMS = 20
@@ -134,6 +145,67 @@ class CitationCheck:
     retrievable: bool
     supports_attached_claim: bool
     flag: CitationFlag
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """The aggregate verdict for a verification (FR10 / PRD §6 `verdict` + `confidence` + `stats`).
+
+    Frozen (immutable, hashable) like `Claim`/`Evidence`/`Judgment`/`CitationCheck`. Produced
+    by `proov.verdict.aggregate_verdict` (Story 2.5) and mapped into the delivered deliverable
+    by Story 2.6. The four `int` count fields are **exactly** the PRD §6 `stats` object
+    `{claims_total, supported, unsupported, unverifiable}` (Story 2.6 splats them straight in);
+    `label` is the PRD §6 `verdict` enum value. `confidence` is always a `float` (never an
+    `int`) — it is hashed into the report body in Story 2.6 where `0` and `0.0` canonicalise
+    to different bytes, so the aggregator stores it via `clamp_confidence`. The count fields are
+    genuine whole-number `int`s (no float-canonicalisation trap — they are never compared
+    against floats). Field order is the PRD §6 verdict+stats shape and MUST NOT change.
+    """
+
+    label: VerdictLabel
+    confidence: float
+    claims_total: int
+    supported: int
+    unsupported: int
+    unverifiable: int
+
+
+@dataclass(frozen=True)
+class ClaimFinding:
+    """One extracted claim paired with its per-claim judgment (Story 2.6).
+
+    Frozen (immutable, hashable) like every other engine type. This is the unit the
+    single-pass engine (`proov.engine.verify`) accumulates **in extraction order** — the
+    deliverable builder (Story 2.6) maps each finding into a PRD §6 `claims[]` entry, and
+    `aggregate_verdict` rolls `[f.judgment for f in findings]` into the `Verdict`. Carries
+    no confidence/float of its own; the float lives on `judgment.confidence`.
+    """
+
+    claim: Claim
+    judgment: Judgment
+
+
+@dataclass(frozen=True)
+class Report:
+    """The full single-pass verification result the `[B]` engine returns (Story 2.6).
+
+    Frozen (immutable, hashable) like the other engine types. `findings` and `citations`
+    are **tuples** (not lists) so `Report` stays both frozen *and* hashable — mirroring
+    `Judgment.evidence: tuple[...]`; a `list` field would silently break hashability.
+    `findings` are in extraction order and `citations` in provided-source order — that
+    order is load-bearing because both are serialised into the hashed report body (Story
+    2.6 / the Story 1.4 `report_hash` reproducibility contract). `model` is the active LLM
+    provider's model id (FR14 — stamped into the receipt, never the old `stub-no-engine`).
+
+    This is the SDK-agnostic currency the deliverable builder consumes (architecture §7
+    "the `Report` … is the reusable currency"): `dict` in to `verify`, `Report` out, no
+    `croo`/`httpx`/I/O anywhere in this module.
+    """
+
+    verdict: Verdict
+    findings: tuple[ClaimFinding, ...]
+    citations: tuple[CitationCheck, ...]
+    model: str
 
 
 def clamp_confidence(value) -> float:

@@ -23,6 +23,13 @@ receipt bytes are unchanged. A verifier reproducing `report_hash` from the deliv
 must strip **both** `receipt` and `verified_by_proov` before re-canonicalising. The
 tx-bearing form (concrete on-chain `anchor`) is assembled post-delivery by the provider.
 
+As of Story 2.6 the REAL builder `build_deliverable` lands: it maps an engine `Report`
+(`proov.engine.verify`) into a real PRD §6 body — the actual aggregated `verdict`/
+`confidence`/`stats`, the per-claim `claims[]` evidence trail (FR13), the citation flags,
+and a real receipt stamping the REAL model id (FR14, e.g. `gemini-2.5-flash`/`stub-llm`,
+no longer `stub-no-engine`). `build_stub_deliverable` (offline default until the engine is
+wired) and `build_graceful_deliverable` (the provider's error backstop) both REMAIN.
+
 Pure and SDK-agnostic (no `croo` import, no I/O): the provider serialises the returned
 dict with `canonical_json` so the on-chain anchor is reproducible (Story 1.4 contract).
 """
@@ -34,6 +41,7 @@ from typing import Any
 from . import __version__
 from .badge import build_verified_artifact
 from .receipt import build_receipt
+from .types import Report
 
 # Clear, honest stub copy so anyone inspecting a delivered order knows the engine is
 # pending rather than mistaking the stub for a real verdict.
@@ -140,5 +148,86 @@ def build_graceful_deliverable(
     )
     # In-band badge sibling (see build_stub_deliverable) — a degraded order is still
     # delivered, so it carries the artifact like any delivered deliverable.
+    badge = build_verified_artifact(receipt)
+    return {**report_body, "receipt": receipt, "verified_by_proov": badge}
+
+
+def build_deliverable(order: Any, tier: str, *, output_text: str, report: Report) -> dict:
+    """Map an engine `Report` into a REAL PRD §6 deliverable + real receipt (Story 2.6).
+
+    The real counterpart of `build_stub_deliverable`: instead of a stub body it serialises
+    the actual aggregated `report.verdict`, the ordered per-claim `findings` (FR13 evidence
+    trail) and the citation flags. Then it computes the real `receipt` (stamping
+    `report.model` — FR14) and the in-band `verified_by_proov` badge EXACTLY as
+    `build_stub_deliverable` does (receipt over the body excluding `receipt`/
+    `verified_by_proov`; badge a sibling added after).
+
+    Determinism (Story 1.4 `report_hash` contract — the trap surface is now real claims +
+    multiple confidences): claims stay in `findings` order, citations in `report.citations`
+    order, EVERY confidence stays a `float` (they come from `clamp_confidence` already — never
+    int-coerce or round), counts are genuine `int`s, and the summary is a pure template (no
+    clock/RNG). Pure / SDK-agnostic (no `croo`, no I/O) like its siblings; `order` is accepted
+    for forward-compat.
+    """
+    v = report.verdict
+    # Deterministic human summary from the label + counts — pure template, no clock/RNG.
+    summary = (
+        f"Verified {v.claims_total} claims: {v.supported} supported, "
+        f"{v.unsupported} unsupported, {v.unverifiable} unverifiable; verdict: {v.label}."
+    )
+    # Per-claim findings in extraction order (FR13). Every per-claim `confidence` stays a
+    # float — same canonicalisation trap as the top-level confidence.
+    claims = [
+        {
+            "id": f.claim.id,
+            "claim": f.claim.text,
+            "status": f.judgment.status,
+            "confidence": f.judgment.confidence,
+            "evidence": [
+                {"source": s.source, "quote": s.quote, "stance": s.stance}
+                for s in f.judgment.evidence
+            ],
+        }
+        for f in report.findings
+    ]
+    citations_checked = [
+        {
+            "source": c.source,
+            "retrievable": c.retrievable,
+            "supports_attached_claim": c.supports_attached_claim,
+            "flag": c.flag,
+        }
+        for c in report.citations
+    ]
+    report_body = {
+        # The REAL aggregated verdict — `pass | fail | partial` (never the stub
+        # `unverifiable`, which `aggregate_verdict` does not emit).
+        "verdict": v.label,
+        # Keep the clamped float as-is: `0` and `0.0` canonicalise to different bytes, which
+        # would shift `report_hash`. Never coerce to int.
+        "confidence": v.confidence,
+        "summary": summary,
+        "claims": claims,
+        "citations_checked": citations_checked,
+        # tier + the four PRD §6 Verdict counts, splatted in.
+        "stats": {
+            "tier": tier,
+            "claims_total": v.claims_total,
+            "supported": v.supported,
+            "unsupported": v.unsupported,
+            "unverifiable": v.unverifiable,
+        },
+        "disclaimer": _DISCLAIMER,
+    }
+    receipt = build_receipt(
+        output_text=output_text,
+        report_body=report_body,
+        verdict=report_body["verdict"],
+        confidence=report_body["confidence"],
+        model=report.model,  # FR14: the REAL model id (e.g. "gemini-2.5-flash"/"stub-llm")
+        version=__version__,
+    )
+    # In-band badge: built AFTER the receipt over the unchanged body — a sibling of
+    # `receipt`, so it never perturbs `report_hash` (anchor=None, receipt_id=report_hash).
     badge = build_verified_artifact(receipt)
     return {**report_body, "receipt": receipt, "verified_by_proov": badge}

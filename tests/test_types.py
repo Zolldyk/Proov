@@ -14,10 +14,14 @@ from proov.types import (
     DEEP_MAX_CLAIMS,
     QUICK_EVIDENCE_K,
     QUICK_MAX_CLAIMS,
+    CitationCheck,
     Claim,
+    ClaimFinding,
     Evidence,
     EvidenceStance,
     Judgment,
+    Report,
+    Verdict,
     clamp_confidence,
     evidence_k_for_tier,
     max_claims_for_tier,
@@ -138,6 +142,41 @@ def test_judgment_evidence_defaults_to_empty_tuple():
     j = Judgment(status="unverifiable", confidence=0.0)
     assert j.evidence == ()
     assert isinstance(j.evidence, tuple)
+
+
+# --------------------------------------------------------------------------- ClaimFinding / Report
+
+
+def _finding() -> ClaimFinding:
+    return ClaimFinding(
+        claim=Claim(id="c1", text="A claim."),
+        judgment=Judgment(status="supported", confidence=0.8),
+    )
+
+
+def test_claim_finding_is_frozen_and_hashable():
+    f = _finding()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        f.claim = Claim(id="c2", text="other")  # type: ignore[misc]
+    assert hash(f) == hash(_finding())
+
+
+def test_report_is_frozen_and_hashable_with_tuple_fields():
+    verdict = Verdict(
+        label="pass", confidence=0.8, claims_total=1, supported=1, unsupported=0, unverifiable=0
+    )
+    citation = CitationCheck(
+        source="https://x", retrievable=True, supports_attached_claim=True, flag="ok"
+    )
+    report = Report(verdict=verdict, findings=(_finding(),), citations=(citation,), model="m")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        report.model = "other"  # type: ignore[misc]
+    # tuple findings/citations keep Report hashable (mirrors Judgment.evidence).
+    assert isinstance(report.findings, tuple)
+    assert isinstance(report.citations, tuple)
+    assert hash(report) == hash(
+        Report(verdict=verdict, findings=(_finding(),), citations=(citation,), model="m")
+    )
 
 
 # --------------------------------------------------------------------------- clamp_confidence

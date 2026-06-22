@@ -9,12 +9,25 @@ from __future__ import annotations
 import json
 
 from proov import services
-from proov.deliverable import build_graceful_deliverable, build_stub_deliverable
+from proov.deliverable import (
+    build_deliverable,
+    build_graceful_deliverable,
+    build_stub_deliverable,
+)
 from proov.receipt import canonical_json, keccak256_hex
 from proov.services import (
     DEEP_SERVICE_ID,
     QUICK_SERVICE_ID,
     tier_for_service,
+)
+from proov.types import (
+    CitationCheck,
+    Claim,
+    ClaimFinding,
+    EvidenceStance,
+    Judgment,
+    Report,
+    Verdict,
 )
 
 # PRD §6 receipt contract — the eight keys the populated receipt must carry.
@@ -188,6 +201,124 @@ def test_graceful_deliverable_output_hash_is_keccak_of_output_text():
         order=object(), tier="quick", output_text=output_text, reason="x"
     )
     assert payload["receipt"]["output_hash"] == keccak256_hex(output_text.encode("utf-8"))
+
+
+def _sample_report(*, confidence=0.9, model="gemini-2.5-flash") -> Report:
+    """A small real `Report`: one supported claim with grounded evidence + one ok citation."""
+    finding = ClaimFinding(
+        claim=Claim(id="c1", text="Paris is the capital of France."),
+        judgment=Judgment(
+            status="supported",
+            confidence=confidence,
+            evidence=(
+                EvidenceStance(
+                    source="https://stub.local/paris/1",
+                    quote="Paris is the capital of France",
+                    stance="supports",
+                ),
+            ),
+        ),
+    )
+    citation = CitationCheck(
+        source="https://stub.local/paris/1",
+        retrievable=True,
+        supports_attached_claim=True,
+        flag="ok",
+    )
+    verdict = Verdict(
+        label="pass",
+        confidence=confidence,
+        claims_total=1,
+        supported=1,
+        unsupported=0,
+        unverifiable=0,
+    )
+    return Report(verdict=verdict, findings=(finding,), citations=(citation,), model=model)
+
+
+def test_build_deliverable_has_all_prd6_keys():
+    payload = build_deliverable(object(), "quick", output_text="x", report=_sample_report())
+    assert _PRD6_KEYS.issubset(payload.keys())
+    assert "verified_by_proov" in payload
+
+
+def test_build_deliverable_maps_the_real_verdict_and_confidence():
+    report = _sample_report()
+    payload = build_deliverable(object(), "quick", output_text="x", report=report)
+    # The REAL aggregated verdict, not the stub `unverifiable`.
+    assert payload["verdict"] == "pass"
+    assert payload["confidence"] == report.verdict.confidence
+
+
+def test_build_deliverable_stats_is_tier_plus_four_counts():
+    payload = build_deliverable(object(), "deep", output_text="x", report=_sample_report())
+    assert payload["stats"] == {
+        "tier": "deep",
+        "claims_total": 1,
+        "supported": 1,
+        "unsupported": 0,
+        "unverifiable": 0,
+    }
+
+
+def test_build_deliverable_per_claim_finding_shape():
+    payload = build_deliverable(object(), "quick", output_text="x", report=_sample_report())
+    assert len(payload["claims"]) == 1
+    claim = payload["claims"][0]
+    assert set(claim.keys()) == {"id", "claim", "status", "confidence", "evidence"}
+    assert claim["id"] == "c1"
+    assert claim["claim"] == "Paris is the capital of France."
+    assert claim["status"] == "supported"
+    ev = claim["evidence"][0]
+    assert set(ev.keys()) == {"source", "quote", "stance"}
+    assert ev["stance"] == "supports"
+
+
+def test_build_deliverable_confidences_stay_float_even_when_zero():
+    # Every confidence (top-level + per-claim) must stay a float — `0` vs `0.0` canonicalise
+    # to different bytes, which would shift report_hash.
+    payload = build_deliverable(
+        object(), "quick", output_text="x", report=_sample_report(confidence=0.0)
+    )
+    assert isinstance(payload["confidence"], float)
+    assert payload["confidence"] == 0.0
+    assert isinstance(payload["claims"][0]["confidence"], float)
+    assert payload["claims"][0]["confidence"] == 0.0
+
+
+def test_build_deliverable_citations_checked_shape():
+    payload = build_deliverable(object(), "quick", output_text="x", report=_sample_report())
+    assert len(payload["citations_checked"]) == 1
+    c = payload["citations_checked"][0]
+    assert set(c.keys()) == {"source", "retrievable", "supports_attached_claim", "flag"}
+    assert c["flag"] == "ok"
+
+
+def test_build_deliverable_receipt_carries_real_model_and_is_reproducible():
+    report = _sample_report(model="gemini-2.5-flash")
+    payload = build_deliverable(object(), "quick", output_text="hello", report=report)
+    receipt = payload["receipt"]
+    # FR14: the REAL model id, not the stub `stub-no-engine`.
+    assert receipt["model"] == "gemini-2.5-flash"
+    assert receipt["version"] == "0.1.0"
+    assert receipt["output_hash"] == keccak256_hex("hello".encode("utf-8"))
+    # report_hash reproduces over the body minus BOTH artifact siblings.
+    body = {k: v for k, v in payload.items() if k not in ("receipt", "verified_by_proov")}
+    assert receipt["report_hash"] == keccak256_hex(canonical_json(body).encode("utf-8"))
+
+
+def test_build_deliverable_is_json_serialisable():
+    payload = build_deliverable(object(), "quick", output_text="x", report=_sample_report())
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_build_deliverable_carries_in_band_badge_with_real_verdict():
+    payload = build_deliverable(object(), "quick", output_text="x", report=_sample_report())
+    badge = payload["verified_by_proov"]
+    assert badge["anchor"] is None
+    assert badge["receipt_id"] == payload["receipt"]["report_hash"]
+    assert badge["verdict"] == "pass"
+    assert badge["schema"] == "proov.verified-by-proov.v1"
 
 
 def test_tier_for_service_maps_known_ids():
