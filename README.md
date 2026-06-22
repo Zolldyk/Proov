@@ -268,3 +268,46 @@ A **pure, SDK-agnostic validator** (`proov/validation.py` → `validate_requirem
 **SLA-timeout refunds are platform-automatic.** If Proov cannot deliver within an order's SLA, the CAP escrow **automatically refunds** the Requester when the deadline passes (`order → expired`, refund) — **no provider action, and the provider must never manually refund**. Proov's only responsibility is to not block forever and to degrade-to-deliver where it can. [Source: CROO Security & Trust Model — "Timeout triggers automatic refund with no manual intervention required".]
 
 > **Live reject/refund is verifiable but kept manual.** The automated suite (`pytest`) exercises every branch on a fake SDK client and never touches the live platform. A live negotiation-stage reject costs the buyer **nothing** (no pay); a live paid-stage reject costs a real ~$0.10 USDC round-trip (refunded), so it stays a manual check, not part of CI.
+
+## Claim extraction (Story 2.1)
+
+The first slice of the verification engine: extract discrete, checkable factual **claims** from a submitted output, behind a **pluggable** `LLMProvider` interface so the model can be swapped without touching the engine. `proov/types.py` (pure) holds the `Claim`/`Tier` types and the per-tier caps; `proov/llm.py` holds the interface, providers, factory, and a provider-agnostic `extract_claims` entrypoint.
+
+- **Pluggable by design.** `LLMProvider` is a `@runtime_checkable` `Protocol`; the only code that names a concrete provider is the `get_llm_provider` factory. Adding a provider means implementing `extract_claims` and registering it — no engine change (the epic's load-bearing AC).
+- **Gemini 2.5 Flash (primary).** A thin raw-REST provider via `httpx` with structured-JSON output (no vendor SDK). The key is sent in the `x-goog-api-key` **header, never the `?key=` query param**, and is `register_secret`-ed so it can never leak into a log.
+- **Caps (FR6).** Quick = 20 claims, Deep = default 50; a caller `options.max_claims` may **lower** the cap but never raise it above the tier ceiling.
+- **Degrade, don't drop (NFR3).** A transport/status/timeout failure raises `LLMError` (→ the Story 1.5 graceful seam turns it into an honest `unverifiable`); a successful response that yields no parseable claims returns `[]` — an empty extraction is a valid outcome, not a crash.
+
+**LLM env vars** (all optional for the offline suite — see below):
+
+```
+GEMINI_API_KEY=...              # required for the live Gemini provider (free key from Google AI Studio;
+                                # GOOGLE_API_KEY is also accepted as a fallback)
+PROOV_LLM_PROVIDER=gemini       # default `gemini`; set `stub` for the deterministic offline provider
+PROOV_LLM_MODEL=gemini-2.5-flash
+PROOV_LLM_TIMEOUT=30            # per-call timeout in seconds (garbage falls back to 30)
+```
+
+> **The suite runs fully offline and needs no key.** `StubLLMProvider` (deterministic, zero network) and a mocked `httpx.MockTransport` cover every path — no test opens a real socket or spends Gemini quota. A live Gemini smoke is kept manual.
+
+## Evidence retrieval (Story 2.2)
+
+The second slice of the verification engine: retrieve real, source-linked **evidence** for each extracted claim, behind a **pluggable** `SearchProvider` interface so the search backend can be swapped without touching the engine. `proov/types.py` (pure) gains the `Evidence` type and the per-tier evidence counts; `proov/search.py` holds the interface, providers, factory/chain, and a provider-agnostic `retrieve_evidence` entrypoint. It mirrors the shape of `proov/llm.py` beat-for-beat.
+
+- **Pluggable by design.** `SearchProvider` is a `@runtime_checkable` `Protocol` declaring only `search(query, k)`; the only code that names a concrete provider is `get_search_provider` + `default_search_chain`. Adding a backend (e.g. Serper) means implementing `search` and registering it — no engine change.
+- **Wikipedia (keyless, always-on fallback).** A thin raw-REST provider hitting the MediaWiki REST `search/page` endpoint via `httpx` (no key, no vendor SDK). The match-highlight HTML in each excerpt is stripped to a clean snippet.
+- **Tavily (optional RAG-native primary).** A thin raw-REST `POST /search` via `httpx`. The key is sent in the `Authorization: Bearer` **header, never a URL/body**, and is `register_secret`-ed so it can never leak into a log. Free tier ≈ 1,000 searches/mo.
+- **Fallback Tavily→Wikipedia, per-claim timeout (FR7).** `retrieve_evidence` tries each provider in order under a per-call `asyncio.wait_for` timeout; on a provider raising `SearchError` or timing out it falls through to the next, and if every provider fails it returns `[]` — the claim becomes `unverifiable` downstream (degrade, don't drop — NFR3). It never raises.
+- **`Evidence` is the raw retrieved chunk only** (`source`/`title`/`snippet`/`score?`) — it carries no `stance`; stance is a *judgment* output (Story 2.3).
+
+**Search env vars** (all optional for the offline suite):
+
+```
+TAVILY_API_KEY=...              # optional RAG-native primary (free key from tavily.com);
+                                # without it, retrieval is Wikipedia-only (keyless)
+PROOV_SEARCH_PROVIDER=          # force a single `wikipedia|tavily|stub`; unset = auto chain
+                                # (Tavily→Wikipedia when keyed, else Wikipedia only)
+PROOV_SEARCH_TIMEOUT=10         # per-call (per-claim) timeout in seconds (garbage falls back to 10)
+```
+
+> **The suite runs fully offline and needs no key.** `StubSearchProvider` (deterministic, zero network) and a mocked `httpx.MockTransport` cover every path — no test opens a real socket or spends Tavily/Wikipedia quota. No new runtime dependency: `httpx` (declared in Story 2.1) covers both providers — deliberately no `tavily-python`/`wikipedia` package (vendor lock-in the pluggable interface exists to avoid). A live smoke is kept manual.

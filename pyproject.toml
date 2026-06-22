@@ -4,8 +4,7 @@ version = "0.1.0"
 description = "Proof-of-Verification Oracle — a paid, callable CAP agent on the CROO Agent Store."
 readme = "README.md"
 requires-python = ">=3.10"
-# LLM/search/web-framework deps arrive in Epics 2-4 — do NOT add them here yet
-# (keep the dependency surface minimal).
+# Web-framework/search deps arrive in Epics 3-4 — keep the dependency surface minimal.
 dependencies = [
     "croo-sdk",
     # First non-croo runtime dep (Story 1.4). Provides real Ethereum keccak256 for the
@@ -13,6 +12,11 @@ dependencies = [
     # silently fail to match CAP's Base anchor. pycryptodome is a single pure package
     # (ships 3.13 wheels) and pulls in NO Ethereum stack.
     "pycryptodome>=3.20",
+    # Async HTTP client for the Gemini LLM provider (Story 2.1) — and the Story 2.2 search
+    # provider. Already installed (0.28.1, transitive via croo-sdk); declared here to make
+    # the now-direct dependency explicit. Deliberately NO vendor LLM SDK (google-genai):
+    # a thin raw-REST provider keeps the LLMProvider interface thin and swappable.
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
