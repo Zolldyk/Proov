@@ -22,8 +22,11 @@ computer for the success + counter-metrics (orders, unique buyer wallets, counte
 completion rate, self-trade ratio, cost/order); `ledger` is a best-effort SQLite order log the
 provider writes at every terminal order (mirroring `cache`'s degrade-don't-drop discipline); and
 `scripts/dashboard.py` prints the dashboard offline ($0) or reconciles real `list_orders` with the
-ledger under `--live`. Only `[A]` is CROO-coupled — `[B]`/`[C]`/`[D]`/`[E]` stay pure,
-SDK-agnostic Python.
+ledger under `--live`. As of Story 3.3 the provider is reliability-hardened — a worker-pool throttle
+bounds concurrent verifications within free-tier RPM, per-claim/per-order SLA bounds degrade to an
+honest `partial` instead of overrunning the wall, and a graceful shutdown drains in-flight
+settlements (auto-reconnect itself stays owned by the SDK's `EventStream`). Only `[A]` is
+CROO-coupled — `[B]`/`[C]`/`[D]`/`[E]` stay pure, SDK-agnostic Python.
 """
 
 # Single source of the Proov version, stamped into every on-chain receipt (Story 1.4).

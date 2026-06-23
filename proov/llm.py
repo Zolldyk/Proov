@@ -40,11 +40,9 @@ import httpx
 from .redaction import register_secret
 from .types import (
     Claim,
-    ClaimStatus,
     Evidence,
     EvidenceStance,
     Judgment,
-    Stance,
     Tier,
     clamp_confidence,
     max_claims_for_tier,

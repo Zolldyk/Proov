@@ -32,6 +32,7 @@ reusing the stance the judge already assigned (no re-fetch, no re-judge), passed
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import os
@@ -41,12 +42,18 @@ from typing import Literal
 import httpx
 
 from .llm import judge_claim
+from .llm import _resolve_timeout as _resolve_llm_timeout
 from .types import CitationCheck, CitationFlag, Claim, Evidence, Stance, Tier
 
 logger = logging.getLogger("proov.citations")
 
 # Bound the fetched source text fed to the support judge — payload / LLM-judge cost.
 _MAX_FETCH_CHARS = 2000
+# Story 3.3: bound the RAW body read before stripping/truncation, so one hostile/slow multi-MB
+# source cannot spike memory/CPU. A response whose Content-Length exceeds this is treated as
+# `ambiguous` (we cannot fairly judge a truncated giant); otherwise at most this many bytes are
+# read (`response.content[:_MAX_FETCH_BYTES]`) before `_strip_html`/`_MAX_FETCH_CHARS`.
+_MAX_FETCH_BYTES = 1_000_000
 # Bound the synthetic output-as-claim text handed to the judge.
 _MAX_CLAIM_CHARS = 2000
 # Per-source fetch timeout default; an infinite timeout would defeat the SLA (NFR2).
@@ -180,7 +187,27 @@ async def _fetch_source(
 
     cls = _classify_retrievability(response.status_code, transport_error=False)
     if cls == "retrievable":
-        return (cls, _strip_html(response.text)[:_MAX_FETCH_CHARS])
+        # Story 3.3: bound the body read so a hostile/giant source cannot spike memory/CPU. A
+        # declared `Content-Length` over the cap → `ambiguous` (we cannot fairly judge a
+        # truncated giant; a timeout/oversize cannot prove `fabricated`). Otherwise read at most
+        # `_MAX_FETCH_BYTES` of the raw body (instead of `response.text` over the WHOLE body)
+        # before stripping/truncating.
+        declared = response.headers.get("content-length")
+        if declared is not None:
+            try:
+                if int(declared) > _MAX_FETCH_BYTES:
+                    logger.debug(
+                        "citation source %s oversize (content-length %s > %d) → ambiguous",
+                        url,
+                        declared,
+                        _MAX_FETCH_BYTES,
+                    )
+                    return ("ambiguous", "")
+            except (TypeError, ValueError):
+                pass  # an unparseable header → fall through to the bounded read
+        raw = response.content[:_MAX_FETCH_BYTES]
+        text = raw.decode(response.encoding or "utf-8", "replace")
+        return (cls, _strip_html(text)[:_MAX_FETCH_CHARS])
     logger.debug(
         "citation source %s classified %s (status %s)", url, cls, response.status_code
     )
@@ -222,6 +249,43 @@ def _flag_for(cls: Retrievability, status: str | None) -> tuple[bool, bool, Cita
         return (True, False, "misattributed")
     # "unverifiable" / None / blank-content → honest: support unconfirmed, but NOT misattributed.
     return (True, False, "ok")
+
+
+async def _check_one_source(
+    url: str,
+    title: str,
+    output: str,
+    tier: Tier,
+    *,
+    provider,
+    client: httpx.AsyncClient | None,
+    timeout: float,
+    options: dict | None,
+) -> tuple[bool, bool, CitationFlag]:
+    """Fetch + (judge) ONE source → `(retrievable, supports, flag)` — the wrappable unit (3.3).
+
+    Factored out of `check_citations`'s loop so the whole fetch+judge for a source can be bounded
+    by a single `asyncio.wait_for` total-time wall (Story 3.3): a redirect chain plus a slow
+    support judge cannot together exceed a bounded wall. A `retrievable` source with non-blank
+    content is judged for support (the third consumer of `judge_claim`); everything else
+    short-circuits with no judge spend. Raises only what the caller bounds/propagates
+    (`TimeoutError`/`CancelledError`); `_fetch_source` and `judge_claim` already swallow their own
+    transport/LLM errors.
+    """
+    cls, content = await _fetch_source(url, client=client, timeout=timeout)
+    if cls == "retrievable" and content.strip():
+        judgment = await judge_claim(
+            Claim(id="citation-target", text=output[:_MAX_CLAIM_CHARS]),
+            [Evidence(source=url, title=title, snippet=content)],
+            tier,
+            provider=provider,
+            options=options,
+        )
+        status = judgment.status
+    else:
+        # absent → fabricated; ambiguous → ok; retrievable+blank → ok. No spend.
+        status = None
+    return _flag_for(cls, status)
 
 
 async def check_citations(
@@ -293,25 +357,36 @@ async def check_citations(
                 if timeout is not None
                 else os.environ.get("PROOV_CITATION_TIMEOUT")
             )
+            # Story 3.3 per-source TOTAL-time bound: fetch (≤ per_call) + judge (≤ llm_timeout).
+            # One slow/hostile source — a redirect chain plus a slow judge — cannot exceed this
+            # wall (mirrors `retrieve_evidence`'s `wait_for`). Reuses the two already-resolved
+            # timeouts rather than adding a new env knob (Open Question 7).
+            total = per_call + _resolve_llm_timeout(os.environ.get("PROOV_LLM_TIMEOUT"))
 
             for url, title in normalised:
                 try:
-                    cls, content = await _fetch_source(
-                        url, client=client, timeout=per_call
-                    )
-                    if cls == "retrievable" and content.strip():
-                        judgment = await judge_claim(
-                            Claim(id="citation-target", text=output[:_MAX_CLAIM_CHARS]),
-                            [Evidence(source=url, title=title, snippet=content)],
+                    retrievable, supports, flag = await asyncio.wait_for(
+                        _check_one_source(
+                            url,
+                            title,
+                            output,
                             tier,
                             provider=provider,
+                            client=client,
+                            timeout=per_call,
                             options=options,
-                        )
-                        status = judgment.status
-                    else:
-                        # absent → fabricated; ambiguous → ok; retrievable+blank → ok. No spend.
-                        status = None
-                    retrievable, supports, flag = _flag_for(cls, status)
+                        ),
+                        total,
+                    )
+                except asyncio.TimeoutError:
+                    # A timeout cannot prove `fabricated` (the precision contract) — degrade THIS
+                    # source to the conservative non-crying-wolf `ok`, support unconfirmed.
+                    logger.warning(
+                        "citation check timed out for %s after %ss; degrading to ok",
+                        url,
+                        total,
+                    )
+                    retrievable, supports, flag = (True, False, "ok")
                 except Exception as exc:  # noqa: BLE001
                     # Both helpers already never raise, but a pluggable provider could raise
                     # anything; the "never raises out" contract requires we degrade THIS
@@ -321,8 +396,7 @@ async def check_citations(
                     logger.warning(
                         "citation check degraded to ok after error for %s: %r", url, exc
                     )
-                    supports, flag = (False, "ok")
-                    retrievable = True
+                    retrievable, supports, flag = (True, False, "ok")
 
                 results.append(CitationCheck(url, retrievable, supports, flag))
 

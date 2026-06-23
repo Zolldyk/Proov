@@ -40,7 +40,7 @@ import os
 from .citations import check_citations
 from .llm import LLMError, extract_claims, get_llm_provider, judge_claim
 from .search import retrieve_evidence
-from .types import ClaimFinding, Report, Stance, Tier
+from .types import CitationCheck, ClaimFinding, Report, Stance, Tier
 from .verdict import aggregate_verdict
 
 logger = logging.getLogger("proov.engine")
@@ -139,10 +139,11 @@ async def verify(input: dict, tier: Tier, *, options: dict | None = None) -> Rep
 
     # Per-order SLA deadline (NFR2), per tier. Captured once at TRUE entry — BEFORE extraction
     # — so the budget bounds the WHOLE single-pass pipeline (extraction + judging loop): ~60s
-    # headroom under Quick's 5-min wall, ~2 min under Deep's 30-min wall. Checked at the TOP of
-    # each judging iteration so we
-    # never hard-cancel mid-await (which would lose the in-flight finding and risk a
-    # CancelledError escaping). Sequential judging; bounded concurrency is Story 3.3.
+    # headroom under Quick's 5-min wall, ~2 min under Deep's 30-min wall. As of Story 3.3 each
+    # slice (retrieve, judge, citation check) is bounded by the REMAINING budget (not just
+    # checked at the top of the loop), so a single slow claim — or a Deep claim's ≤7 sequential
+    # self-consistency passes — cannot overrun the wall before the next check. Sequential
+    # judging; bounded concurrency lives in the provider (Story 3.3 worker-pool).
     deadline = _now() + _resolve_sla_seconds(tier)
 
     # Resolve the LLM provider ONCE so the stamped model is the one that judged (FR14).
@@ -173,10 +174,18 @@ async def verify(input: dict, tier: Tier, *, options: dict | None = None) -> Rep
         )
         claims = []
 
-    # (b) Sequential per-claim judging under the per-order deadline captured above.
+    # (b) Sequential per-claim judging under the per-order deadline captured above. Each slice
+    # is bounded by the REMAINING budget (Story 3.3): a slow `retrieve_evidence` or `judge_claim`
+    # cannot push the order past its SLA wall — it trips `asyncio.TimeoutError`, the loop stops
+    # early, and the run aggregates whatever was judged → an honest `partial` (NOT a thrown
+    # error, NOT a dropped order). `asyncio.wait_for` raises `asyncio.TimeoutError` (a plain
+    # `Exception`) on a bound; genuine task cancellation raises `asyncio.CancelledError` (a
+    # `BaseException`, a DISTINCT type) which is intentionally NOT caught here and still
+    # propagates (NFR3 — cancellation must never be swallowed).
     findings: list[ClaimFinding] = []
     for index, claim in enumerate(claims):
-        if _now() >= deadline:
+        remaining = deadline - _now()
+        if remaining <= 0:
             logger.warning(
                 "%s SLA budget hit, stopping after %d/%d claims → partial",
                 tier,
@@ -184,8 +193,31 @@ async def verify(input: dict, tier: Tier, *, options: dict | None = None) -> Rep
                 len(claims),
             )
             break
-        evidence = await retrieve_evidence(claim.text, tier, options=opts)
-        judgment = await judge_claim(claim, evidence, tier, provider=provider, options=opts)
+        try:
+            evidence = await asyncio.wait_for(
+                retrieve_evidence(claim.text, tier, options=opts), remaining
+            )
+            remaining = deadline - _now()
+            if remaining <= 0:
+                logger.warning(
+                    "%s SLA budget hit after retrieval, stopping after %d/%d claims → partial",
+                    tier,
+                    index,
+                    len(claims),
+                )
+                break
+            judgment = await asyncio.wait_for(
+                judge_claim(claim, evidence, tier, provider=provider, options=opts),
+                remaining,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "%s SLA budget hit mid-claim, stopping after %d/%d claims → partial",
+                tier,
+                index,
+                len(claims),
+            )
+            break
         findings.append(ClaimFinding(claim=claim, judgment=judgment))
 
     # (c) Citation check over the buyer-provided sources (provided-source order preserved).
@@ -194,28 +226,57 @@ async def verify(input: dict, tier: Tier, *, options: dict | None = None) -> Rep
     # already assigned — collected here at zero extra cost (NO re-fetch/re-judge) and passed to
     # `check_citations`. Provided urls are excluded so they are not double-listed. Quick passes
     # nothing (provided-only).
-    if tier == "deep":
-        provided_urls = {
-            src.get("url").strip()
-            for src in sources
-            if isinstance(src, dict)
-            and isinstance(src.get("url"), str)
-            and src["url"].strip()
-        }
-        discovered: list[tuple[str, Stance]] = []
-        seen_sources: set[str] = set()
-        for finding in findings:
-            for stance_item in finding.judgment.evidence:
-                source = stance_item.source
-                if source in seen_sources or source in provided_urls:
-                    continue
-                seen_sources.add(source)
-                discovered.append((source, stance_item.stance))
-        citations = await check_citations(
-            output_text, sources, tier, options=opts, discovered=discovered
+    #
+    # Bounded by the REMAINING budget (Story 3.3): a slow/oversized citation fetch on a
+    # near-deadline order must not push it past its SLA wall. If the budget is already spent
+    # (`remaining <= 0`) the call is skipped; on `asyncio.TimeoutError` it degrades to no
+    # citations. Either way the pure/total `aggregate_verdict` still runs → an honest verdict.
+    # The cheap discovered-source collection is pure (no await) and runs before the bound.
+    citations: list[CitationCheck] = []
+    remaining = deadline - _now()
+    if remaining <= 0:
+        logger.warning(
+            "%s SLA budget exhausted before citation check → citations degraded to []", tier
         )
     else:
-        citations = await check_citations(output_text, sources, tier, options=opts)
+        try:
+            if tier == "deep":
+                provided_urls = {
+                    src.get("url").strip()
+                    for src in sources
+                    if isinstance(src, dict)
+                    and isinstance(src.get("url"), str)
+                    and src["url"].strip()
+                }
+                discovered: list[tuple[str, Stance]] = []
+                seen_sources: set[str] = set()
+                for finding in findings:
+                    for stance_item in finding.judgment.evidence:
+                        source = stance_item.source
+                        if source in seen_sources or source in provided_urls:
+                            continue
+                        seen_sources.add(source)
+                        discovered.append((source, stance_item.stance))
+                citations = list(
+                    await asyncio.wait_for(
+                        check_citations(
+                            output_text, sources, tier, options=opts, discovered=discovered
+                        ),
+                        remaining,
+                    )
+                )
+            else:
+                citations = list(
+                    await asyncio.wait_for(
+                        check_citations(output_text, sources, tier, options=opts),
+                        remaining,
+                    )
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "%s SLA budget hit at citation check → citations degraded to []", tier
+            )
+            citations = []
 
     # (d) Deterministic aggregation (pure/total — consumed unchanged).
     verdict = aggregate_verdict([f.judgment for f in findings], list(citations), options=opts)

@@ -7,13 +7,18 @@ disabled suite-wide; these tests construct the cache classes directly.
 
 from __future__ import annotations
 
+import asyncio
+import sqlite3
+
 import pytest
 
 from proov.cache import (
     EvidenceCache,
     NullCache,
     SqliteEvidenceCache,
+    _DEFAULT_MAX_ROWS,
     _DEFAULT_TTL_SECONDS,
+    _resolve_max_rows,
     _resolve_ttl_seconds,
     evidence_cache_key,
     get_evidence_cache,
@@ -234,3 +239,68 @@ def test_resolve_ttl_defaults_and_rejects_garbage():
 def test_classes_conform_to_protocol():
     assert isinstance(SqliteEvidenceCache(":memory:"), EvidenceCache)
     assert isinstance(NullCache(), EvidenceCache)
+
+
+# --------------------------------------------------------------------------- size-cap (Story 3.3)
+
+
+def test_resolve_max_rows_defaults_and_disable():
+    assert _resolve_max_rows(None) == _DEFAULT_MAX_ROWS
+    assert _resolve_max_rows("not-a-number") == _DEFAULT_MAX_ROWS
+    assert _resolve_max_rows("5000") == 5000
+    assert _resolve_max_rows("0") == 0  # ≤0 DISABLES the cap (sentinel 0)
+    assert _resolve_max_rows("-5") == 0
+
+
+async def test_size_cap_prunes_oldest_on_put():
+    # Over-cap puts prune the OLDEST rows (by created_at) down to the cap, best-effort, on put.
+    clock = _Clock()
+    cache = SqliteEvidenceCache(":memory:", max_rows=3, clock=clock)
+    for i in range(5):
+        clock.advance(1)  # strictly increasing created_at so "oldest" is well-defined
+        await cache.put(f"k{i}", [_ev()])
+    rows = cache._conn.execute("SELECT COUNT(*) FROM evidence_cache").fetchone()[0]
+    assert rows == 3  # pruned down to the cap
+    assert await cache.get("k0") is None  # oldest two evicted
+    assert await cache.get("k1") is None
+    assert await cache.get("k2") is not None  # the three most-recent kept
+    assert await cache.get("k4") is not None
+
+
+async def test_size_cap_disabled_keeps_all_rows():
+    cache = SqliteEvidenceCache(":memory:", max_rows=0)  # 0 = disabled
+    for i in range(5):
+        await cache.put(f"k{i}", [_ev()])
+    rows = cache._conn.execute("SELECT COUNT(*) FROM evidence_cache").fetchone()[0]
+    assert rows == 5  # no cap → nothing pruned
+
+
+async def test_prune_error_still_lets_put_succeed(monkeypatch):
+    # A forced prune `sqlite3.Error` must NEVER fail a `put` — the row is already stored.
+    cache = SqliteEvidenceCache(":memory:", max_rows=1)
+
+    def _boom():
+        raise sqlite3.Error("prune boom")
+
+    monkeypatch.setattr(cache, "_prune_to_cap", _boom)
+    await cache.put("k", [_ev("https://x")])  # must not raise
+    assert await cache.get("k") is not None  # the row was stored despite the prune failure
+
+
+# --------------------------------------------------------------------------- factory lock (3.3)
+
+
+async def test_factory_double_checked_lock_builds_one_instance(monkeypatch):
+    # Concurrent `get_evidence_cache()` calls (the worker-pool's order tasks) build EXACTLY ONE
+    # instance under the double-checked `threading.Lock` — no two connections, no leaked one.
+    monkeypatch.setenv("PROOV_CACHE_ENABLED", "1")
+    monkeypatch.setenv("PROOV_CACHE_PATH", ":memory:")
+    reset_evidence_cache()
+    try:
+        results = await asyncio.gather(
+            *[asyncio.to_thread(get_evidence_cache) for _ in range(8)]
+        )
+        assert all(c is results[0] for c in results)  # one shared singleton
+        assert isinstance(results[0], SqliteEvidenceCache)
+    finally:
+        reset_evidence_cache()

@@ -9,6 +9,8 @@ contract is exercised directly.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from proov import engine as engine_mod
@@ -159,13 +161,15 @@ async def test_sla_early_stop_before_any_claim_yields_partial_without_raising(mo
 
 
 async def test_sla_early_stop_preserves_completed_findings(monkeypatch):
-    # Clock: start=0; iter1 check=100 (<240, judge c1); iter2 check=300 (>=240, break).
+    # Per-slice granularity (Story 3.3): the clock is now read BETWEEN retrieve and judge, so the
+    # scripted sequence is deadline=0; iter1 pre-retrieve=100 (<240, remaining 140), iter1
+    # post-retrieve=110 (<240, remaining 130 → judge c1); iter2 pre-retrieve=300 (>=240, break).
     # → exactly ONE completed finding, aggregated into a real verdict, no raise.
     fake = FakeLLMProvider(
         claim_texts=("c1.", "c2.", "c3."), judge_status="unverifiable"
     )
     monkeypatch.setattr(engine_mod, "get_llm_provider", lambda *a, **k: fake)
-    monkeypatch.setattr(engine_mod, "_now", _FakeClock([0.0, 100.0, 300.0]))
+    monkeypatch.setattr(engine_mod, "_now", _FakeClock([0.0, 100.0, 110.0, 300.0]))
     monkeypatch.setattr(engine_mod, "_resolve_sla_seconds", lambda *a, **k: 240.0)
     report = await verify({"output": "c1. c2. c3."}, "quick")
     assert len(report.findings) == 1  # only the first claim was judged before the budget hit
@@ -329,8 +333,93 @@ async def test_deep_sla_early_stop_yields_partial(monkeypatch):
     # The Deep budget honours the same honest early-stop → partial as Quick.
     fake = FakeLLMProvider(claim_texts=("c1.", "c2.", "c3."), judge_status="unverifiable")
     monkeypatch.setattr(engine_mod, "get_llm_provider", lambda *a, **k: fake)
-    monkeypatch.setattr(engine_mod, "_now", _FakeClock([0.0, 100.0, 5000.0]))
+    # Per-slice clock (Story 3.3): deadline=0; iter1 pre-retrieve=100, post-retrieve=110 (judge
+    # c1); iter2 pre-retrieve=5000 (>=1680, break) → one finding.
+    monkeypatch.setattr(engine_mod, "_now", _FakeClock([0.0, 100.0, 110.0, 5000.0]))
     monkeypatch.setattr(engine_mod, "_resolve_sla_seconds", lambda *a, **k: 1680.0)
     report = await verify({"output": "c1. c2. c3."}, "deep")
     assert len(report.findings) == 1
     assert report.verdict.label == "partial"
+
+
+# ---------------------------------------------- per-slice timeout granularity (Story 3.3)
+
+
+async def test_per_slice_retrieve_timeout_stops_early_to_partial(monkeypatch):
+    # Story 3.3 AC2: a `retrieve_evidence` slice that never completes trips the per-slice
+    # `wait_for` bound (TimeoutError) → the loop stops BEFORE judging → honest `partial`, no
+    # raise, no claim judged. The budget is tiny-but-positive; the slice hangs on a never-set
+    # Event so the bound ALWAYS fires (deterministic, no real `sleep`, no flake).
+    fake = FakeLLMProvider(claim_texts=("c1.", "c2."))
+    monkeypatch.setattr(engine_mod, "get_llm_provider", lambda *a, **k: fake)
+    monkeypatch.setattr(engine_mod, "_resolve_sla_seconds", lambda *a, **k: 0.02)
+
+    never = asyncio.Event()
+
+    async def _hang(*_a, **_k):
+        await never.wait()
+
+    monkeypatch.setattr(engine_mod, "retrieve_evidence", _hang)
+
+    report = await verify({"output": "c1. c2."}, "quick")
+    assert report.findings == ()  # nothing judged before the bound tripped
+    assert fake.judge_calls == 0  # never reached the judge slice
+    assert report.verdict.label == "partial"
+
+
+async def test_per_slice_judge_timeout_stops_early_to_partial(monkeypatch):
+    # AC2: retrieve completes (stub, instant) but the JUDGE slice hangs → the second per-slice
+    # `wait_for` trips → stop early → `partial`. No finding is appended for the in-flight claim.
+    fake = FakeLLMProvider(claim_texts=("c1.",))
+    monkeypatch.setattr(engine_mod, "get_llm_provider", lambda *a, **k: fake)
+    monkeypatch.setattr(engine_mod, "_resolve_sla_seconds", lambda *a, **k: 0.05)
+
+    never = asyncio.Event()
+
+    async def _hang_judge(*_a, **_k):
+        await never.wait()
+
+    monkeypatch.setattr(engine_mod, "judge_claim", _hang_judge)
+
+    report = await verify({"output": "c1."}, "quick")
+    assert report.findings == ()
+    assert report.verdict.label == "partial"
+
+
+async def test_cancellederror_from_a_slice_propagates(monkeypatch):
+    # AC2: `asyncio.CancelledError` (a BaseException, DISTINCT from TimeoutError) raised inside a
+    # slice is genuine task cancellation and must PROPAGATE out of `verify` — never swallowed by
+    # the per-slice `except asyncio.TimeoutError`.
+    fake = FakeLLMProvider(claim_texts=("c1.",))
+    monkeypatch.setattr(engine_mod, "get_llm_provider", lambda *a, **k: fake)
+
+    async def _cancel(*_a, **_k):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(engine_mod, "retrieve_evidence", _cancel)
+
+    with pytest.raises(asyncio.CancelledError):
+        await verify({"output": "c1."}, "quick")
+
+
+async def test_citation_check_timeout_degrades_to_empty_but_returns(monkeypatch):
+    # AC2: the post-loop citation check is bounded by the remaining budget; a hung
+    # `check_citations` trips its `wait_for` → citations degrade to () but `verify` STILL returns
+    # a Report (the pure/total aggregate always runs). The judged finding survives.
+    fake = FakeLLMProvider(claim_texts=("c1.",))
+    monkeypatch.setattr(engine_mod, "get_llm_provider", lambda *a, **k: fake)
+    monkeypatch.setattr(engine_mod, "_resolve_sla_seconds", lambda *a, **k: 0.05)
+
+    never = asyncio.Event()
+
+    async def _hang_citations(*_a, **_k):
+        await never.wait()
+
+    monkeypatch.setattr(engine_mod, "check_citations", _hang_citations)
+
+    report = await verify(
+        {"output": "c1.", "sources": [{"url": "https://x.example"}]}, "quick"
+    )
+    assert report.citations == ()  # degraded after the bound tripped
+    assert len(report.findings) == 1  # the judged claim survived
+    assert isinstance(report, Report)

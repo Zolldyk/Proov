@@ -7,6 +7,8 @@ suite-wide; these tests construct the ledger classes directly. Mirrors `tests/te
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from proov.ledger import (
@@ -151,5 +153,24 @@ def test_falsey_values_disable_ledger(monkeypatch, flag):
     reset_order_ledger()
     try:
         assert isinstance(get_order_ledger(), NullLedger)
+    finally:
+        reset_order_ledger()
+
+
+# --------------------------------------------------------------------------- factory lock (3.3)
+
+
+async def test_factory_double_checked_lock_builds_one_ledger(monkeypatch):
+    # Concurrent `get_order_ledger()` calls (the worker-pool's order tasks) build EXACTLY ONE
+    # ledger under the double-checked `threading.Lock` — no two connections, no leaked one.
+    monkeypatch.setenv("PROOV_LEDGER_ENABLED", "1")
+    monkeypatch.setenv("PROOV_LEDGER_PATH", ":memory:")
+    reset_order_ledger()
+    try:
+        results = await asyncio.gather(
+            *[asyncio.to_thread(get_order_ledger) for _ in range(8)]
+        )
+        assert all(led is results[0] for led in results)  # one shared singleton
+        assert isinstance(results[0], SqliteOrderLedger)
     finally:
         reset_order_ledger()

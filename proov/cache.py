@@ -53,6 +53,11 @@ logger = logging.getLogger("proov.cache")
 # does not go stale for days. Env-overridable via PROOV_CACHE_TTL_SECONDS.
 _DEFAULT_TTL_SECONDS = 86400.0
 
+# Story 3.3 size-cap: the lazy TTL-on-read prune never evicts a write-once-never-read key, so at
+# volume the table could grow without bound (disk fill / slowdown). A best-effort size-cap prune
+# on `put` bounds it. Env-overridable via PROOV_CACHE_MAX_ROWS; ≤0 disables the cap.
+_DEFAULT_MAX_ROWS = 10000
+
 # A single dedicated table. The order/metrics ledger (Story 3.2) is a SEPARATE table/concern —
 # this name leaves the door open to share the same `.db` file later without coupling now.
 _CREATE_TABLE = (
@@ -80,6 +85,24 @@ def _resolve_ttl_seconds(raw: str | None) -> float:
     if value != value or value in (float("inf"), float("-inf")) or value <= 0:
         return _DEFAULT_TTL_SECONDS
     return value
+
+
+def _resolve_max_rows(raw: str | None) -> int:
+    """Parse `PROOV_CACHE_MAX_ROWS`, tolerating garbage with the default (10000).
+
+    The size-cap (Story 3.3): a row count above this triggers a best-effort prune of the oldest
+    rows on `put`. A None / non-int value → the 10000 default; a ≤0 value → `0` (the disabled
+    sentinel — no cap, matching the env contract "≤0 disables"). Mirrors the hardened resolver
+    idiom, but ≤0 is a meaningful "disable" here rather than a garbage→default.
+    """
+    if raw is None:
+        return _DEFAULT_MAX_ROWS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_ROWS
+    # ≤0 explicitly DISABLES the cap (sentinel 0); a positive value is the cap.
+    return value if value > 0 else 0
 
 
 def _normalise_query(query: str) -> str:
@@ -175,9 +198,12 @@ class SqliteEvidenceCache:
         path: str,
         *,
         ttl_seconds: float = _DEFAULT_TTL_SECONDS,
+        max_rows: int = _DEFAULT_MAX_ROWS,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._ttl_seconds = ttl_seconds
+        # Story 3.3 size-cap: prune oldest rows on `put` once the count exceeds this. ≤0 disables.
+        self._max_rows = max_rows
         # Wall clock (NOT a monotonic clock): the cache persists across process restarts, where
         # a monotonic clock resets. Injectable so TTL expiry is deterministically testable.
         self._clock = clock
@@ -243,9 +269,37 @@ class SqliteEvidenceCache:
                     (key, _to_json(evidence), self._clock()),
                 )
                 self._conn.commit()
+                # Story 3.3 size-cap prune (best-effort, under the same lock, AFTER the row is
+                # committed). Its OWN try/except swallows any `sqlite3.Error` so a prune failure
+                # can never fail a `put` — the row is already stored.
+                self._prune_to_cap()
         except Exception as exc:  # noqa: BLE001
             # Best-effort no-op: the order still delivers from the live `result`.
             logger.warning("Evidence cache put failed, skipping store: %r", exc)
+
+    def _prune_to_cap(self) -> None:
+        """Best-effort: prune the oldest rows down to `max_rows` (Story 3.3). Called under lock.
+
+        Lazy TTL-on-read never evicts a write-once-never-read key, so without this the table can
+        grow without bound at volume. After a `put`, if the row count exceeds `max_rows`, delete
+        the oldest rows (by `created_at`) down to the cap. ≤0 `max_rows` disables it. A prune
+        failure is swallowed (`sqlite3.Error`) — it must NEVER fail a `put` (the row is stored).
+        """
+        if self._max_rows <= 0:
+            return
+        try:
+            count = self._conn.execute(
+                "SELECT COUNT(*) FROM evidence_cache"
+            ).fetchone()[0]
+            if count > self._max_rows:
+                self._conn.execute(
+                    "DELETE FROM evidence_cache WHERE key IN ("
+                    "SELECT key FROM evidence_cache ORDER BY created_at ASC, rowid ASC LIMIT ?)",
+                    (count - self._max_rows,),
+                )
+                self._conn.commit()
+        except sqlite3.Error as exc:
+            logger.warning("Evidence cache size-cap prune skipped: %r", exc)
 
     async def put(self, key: str, evidence: list[Evidence]) -> None:
         await asyncio.to_thread(self._put_sync, key, evidence)
@@ -264,6 +318,12 @@ class SqliteEvidenceCache:
 # once and reuse it. The test suite resets this between tests (see `tests/conftest.py`).
 _default_cache: EvidenceCache | None = None
 
+# Story 3.3: the worker-pool means real concurrent `get_evidence_cache()` callers (two order
+# tasks' `to_thread` SQL can race to build two connections, leaking one). A module-level lock +
+# double-checked locking closes the factory race. The factories are sync, so a `threading.Lock`
+# (not an asyncio lock) is the right primitive.
+_factory_lock = threading.Lock()
+
 _FALSEY = {"0", "false", "no", "off"}
 
 
@@ -271,28 +331,38 @@ def get_evidence_cache() -> EvidenceCache:
     """Return the memoised default `EvidenceCache` (production enabled; degrade to `NullCache`).
 
     Reads `PROOV_CACHE_ENABLED` (default ENABLED; `0`/`false`/`no`/`off`, case-insensitive →
-    `NullCache`), `PROOV_CACHE_PATH` (default `"proov_cache.db"`, gitignored via `*.db`) and
-    `PROOV_CACHE_TTL_SECONDS` (default 86400). A failure to open the DB logs a warning and
-    memoises a `NullCache` (degrade — caching must never crash the engine).
+    `NullCache`), `PROOV_CACHE_PATH` (default `"proov_cache.db"`, gitignored via `*.db`),
+    `PROOV_CACHE_TTL_SECONDS` (default 86400) and `PROOV_CACHE_MAX_ROWS` (default 10000; ≤0
+    disables the size-cap). A failure to open the DB logs a warning and memoises a `NullCache`
+    (degrade — caching must never crash the engine).
+
+    Story 3.3: built under `_factory_lock` with double-checked locking so concurrent callers
+    (the worker-pool's order tasks) cannot build two connections and leak one.
     """
     global _default_cache
     if _default_cache is not None:
         return _default_cache
 
-    enabled = os.environ.get("PROOV_CACHE_ENABLED", "1").strip().lower()
-    if enabled in _FALSEY:
-        _default_cache = NullCache()
-        return _default_cache
+    with _factory_lock:
+        # Double-checked: another thread may have built the singleton while we waited for the lock.
+        if _default_cache is not None:
+            return _default_cache
 
-    try:
-        _default_cache = SqliteEvidenceCache(
-            os.environ.get("PROOV_CACHE_PATH", "proov_cache.db"),
-            ttl_seconds=_resolve_ttl_seconds(os.environ.get("PROOV_CACHE_TTL_SECONDS")),
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Evidence cache unavailable, caching disabled: %r", exc)
-        _default_cache = NullCache()
-    return _default_cache
+        enabled = os.environ.get("PROOV_CACHE_ENABLED", "1").strip().lower()
+        if enabled in _FALSEY:
+            _default_cache = NullCache()
+            return _default_cache
+
+        try:
+            _default_cache = SqliteEvidenceCache(
+                os.environ.get("PROOV_CACHE_PATH", "proov_cache.db"),
+                ttl_seconds=_resolve_ttl_seconds(os.environ.get("PROOV_CACHE_TTL_SECONDS")),
+                max_rows=_resolve_max_rows(os.environ.get("PROOV_CACHE_MAX_ROWS")),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Evidence cache unavailable, caching disabled: %r", exc)
+            _default_cache = NullCache()
+        return _default_cache
 
 
 def reset_evidence_cache() -> None:

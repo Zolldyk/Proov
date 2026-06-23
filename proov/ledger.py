@@ -195,6 +195,13 @@ class SqliteOrderLedger:
 # once and reuse it. The test suite resets this between tests (see `tests/conftest.py`).
 _default_ledger: OrderLedger | None = None
 
+# Story 3.3: the worker-pool means real concurrent `get_order_ledger()` callers (two order tasks
+# could race to build two connections, leaking one). A module-level lock + double-checked locking
+# closes the factory race. The factory is sync, so a `threading.Lock` is the right primitive. No
+# size-cap here — the ledger is an append/upsert audit trail (`INSERT OR REPLACE` keeps it
+# ~1 row/order).
+_factory_lock = threading.Lock()
+
 _FALSEY = {"0", "false", "no", "off"}
 
 
@@ -205,24 +212,32 @@ def get_order_ledger() -> OrderLedger:
     `NullLedger`) and `PROOV_LEDGER_PATH` (default `"proov_ledger.db"`, gitignored via `*.db`).
     A failure to open the DB logs a warning and memoises a `NullLedger` (degrade — the ledger
     must never crash the engine).
+
+    Story 3.3: built under `_factory_lock` with double-checked locking so concurrent callers
+    (the worker-pool's order tasks) cannot build two connections and leak one.
     """
     global _default_ledger
     if _default_ledger is not None:
         return _default_ledger
 
-    enabled = os.environ.get("PROOV_LEDGER_ENABLED", "1").strip().lower()
-    if enabled in _FALSEY:
-        _default_ledger = NullLedger()
-        return _default_ledger
+    with _factory_lock:
+        # Double-checked: another thread may have built the singleton while we waited for the lock.
+        if _default_ledger is not None:
+            return _default_ledger
 
-    try:
-        _default_ledger = SqliteOrderLedger(
-            os.environ.get("PROOV_LEDGER_PATH", "proov_ledger.db")
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Order ledger unavailable, ledger disabled: %r", exc)
-        _default_ledger = NullLedger()
-    return _default_ledger
+        enabled = os.environ.get("PROOV_LEDGER_ENABLED", "1").strip().lower()
+        if enabled in _FALSEY:
+            _default_ledger = NullLedger()
+            return _default_ledger
+
+        try:
+            _default_ledger = SqliteOrderLedger(
+                os.environ.get("PROOV_LEDGER_PATH", "proov_ledger.db")
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Order ledger unavailable, ledger disabled: %r", exc)
+            _default_ledger = NullLedger()
+        return _default_ledger
 
 
 def reset_order_ledger() -> None:

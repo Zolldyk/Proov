@@ -26,6 +26,10 @@ from proov.config import AppConfig
 from proov.provider import (
     FatalProviderError,
     ProviderAdapter,
+    _BoundedIdSet,
+    _resolve_idempotency_max,
+    _resolve_max_concurrent_orders,
+    _resolve_shutdown_drain_seconds,
     _resolve_upload_threshold,
 )
 from proov.receipt import canonical_json, keccak256_hex
@@ -857,3 +861,266 @@ async def test_secret_key_never_appears_in_logs(caplog):
         await adapter.start()
 
     assert all(_DUMMY_KEY not in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------- Reliability hardening (Story 3.3)
+
+
+async def _wait_until(predicate, *, tries: int = 200) -> None:
+    """Yield the event loop until `predicate()` is true (deterministic, no wall-clock sleep)."""
+    for _ in range(tries):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+
+
+def test_resolve_max_concurrent_orders_hardening():
+    # default 3; garbage / non-int / ≤0 → default; a valid value is honoured.
+    assert _resolve_max_concurrent_orders(None) == 3
+    assert _resolve_max_concurrent_orders("5") == 5
+    assert _resolve_max_concurrent_orders("nonsense") == 3
+    assert _resolve_max_concurrent_orders("0") == 3
+    assert _resolve_max_concurrent_orders("-2") == 3
+
+
+def test_resolve_shutdown_drain_seconds_hardening():
+    # default 25; garbage / non-finite / ≤0 → default; a valid value is honoured.
+    assert _resolve_shutdown_drain_seconds(None) == 25.0
+    assert _resolve_shutdown_drain_seconds("10") == 10.0
+    assert _resolve_shutdown_drain_seconds("nonsense") == 25.0
+    assert _resolve_shutdown_drain_seconds("0") == 25.0
+    assert _resolve_shutdown_drain_seconds("inf") == 25.0
+    assert _resolve_shutdown_drain_seconds("nan") == 25.0
+
+
+def test_resolve_idempotency_max_hardening():
+    # default 4096; garbage / non-int / ≤0 → default; a valid value is honoured.
+    assert _resolve_idempotency_max(None) == 4096
+    assert _resolve_idempotency_max("100") == 100
+    assert _resolve_idempotency_max("nonsense") == 4096
+    assert _resolve_idempotency_max("0") == 4096
+    assert _resolve_idempotency_max("-1") == 4096
+
+
+def test_bounded_id_set_evicts_oldest_over_cap():
+    # Push > cap ids: size stays ≤ cap, the OLDEST are evicted, the most-recent are kept.
+    s = _BoundedIdSet(3)
+    for i in range(5):
+        s.add(f"id{i}")
+    assert len(s) == 3
+    assert "id0" not in s and "id1" not in s  # oldest two evicted
+    assert "id2" in s and "id3" in s and "id4" in s  # most-recent kept
+    # discard removes membership (the rollback-on-transient semantic).
+    s.discard("id4")
+    assert "id4" not in s
+
+
+def test_bounded_id_set_re_add_refreshes_recency():
+    # Re-adding an existing id moves it to the most-recent end, so it is NOT the next evicted.
+    s = _BoundedIdSet(2)
+    s.add("a")
+    s.add("b")
+    s.add("a")  # refresh "a" → "b" is now the oldest
+    s.add("c")  # evicts the oldest = "b"
+    assert "a" in s and "c" in s
+    assert "b" not in s
+
+
+async def test_worker_pool_bounds_concurrent_verifications(monkeypatch):
+    # AC1: with max_concurrent_orders=1 and 3 paid orders whose verification blocks on a shared
+    # Event, at most ONE order is in `engine.verify` at a time; the rest queue on the semaphore.
+    # Release → all three complete and deliver. Proven with a counter around an awaited gate, not
+    # timing.
+    import proov.engine as engine_mod
+
+    gate = asyncio.Event()
+    state = {"concurrent": 0, "max": 0}
+    real_verify = engine_mod.verify
+
+    async def _gated_verify(inp, tier, **kwargs):
+        state["concurrent"] += 1
+        state["max"] = max(state["max"], state["concurrent"])
+        try:
+            await gate.wait()
+            return await real_verify(inp, tier, **kwargs)
+        finally:
+            state["concurrent"] -= 1
+
+    monkeypatch.setattr(engine_mod, "verify", _gated_verify)
+
+    stream = FakeEventStream()
+    client = FakeClient(stream)
+    adapter = ProviderAdapter(_cfg(), client=client, max_concurrent_orders=1)
+    await adapter.start()
+
+    for oid in ("o1", "o2", "o3"):
+        stream.dispatch(_event(type=EventType.ORDER_PAID, order_id=oid))
+
+    # All three tasks alive, exactly one inside verify (holding the only slot), two queued.
+    await _wait_until(lambda: len(adapter._tasks) == 3 and state["concurrent"] == 1)
+    assert state["max"] == 1
+    assert state["concurrent"] == 1
+
+    gate.set()
+    await _drain(adapter)
+
+    assert len(client.deliver_calls) == 3  # all delivered after release
+    assert state["max"] == 1  # never more than one in verify at once
+    assert state["concurrent"] == 0
+
+
+async def test_worker_pool_allows_two_when_sized_two(monkeypatch):
+    # AC1: max_concurrent_orders=2 lets exactly two run their verification at once (the third
+    # queues) — proves the semaphore SIZE is the bound, not an accidental serialisation.
+    import proov.engine as engine_mod
+
+    gate = asyncio.Event()
+    state = {"concurrent": 0, "max": 0}
+    real_verify = engine_mod.verify
+
+    async def _gated_verify(inp, tier, **kwargs):
+        state["concurrent"] += 1
+        state["max"] = max(state["max"], state["concurrent"])
+        try:
+            await gate.wait()
+            return await real_verify(inp, tier, **kwargs)
+        finally:
+            state["concurrent"] -= 1
+
+    monkeypatch.setattr(engine_mod, "verify", _gated_verify)
+
+    stream = FakeEventStream()
+    client = FakeClient(stream)
+    adapter = ProviderAdapter(_cfg(), client=client, max_concurrent_orders=2)
+    await adapter.start()
+
+    for oid in ("o1", "o2", "o3"):
+        stream.dispatch(_event(type=EventType.ORDER_PAID, order_id=oid))
+
+    await _wait_until(lambda: len(adapter._tasks) == 3 and state["concurrent"] == 2)
+    assert state["max"] == 2  # two in verify, one queued
+
+    gate.set()
+    await _drain(adapter)
+    assert len(client.deliver_calls) == 3
+    assert state["max"] == 2  # never exceeded the bound
+
+
+async def test_delivered_orders_guard_is_bounded():
+    # AC5: with idempotency_max=2, three distinct delivered orders keep the guard at ≤ cap and
+    # evict the oldest — while all three still deliver (eviction never blocks a NEW order).
+    stream = FakeEventStream()
+    client = FakeClient(stream)
+    adapter = ProviderAdapter(_cfg(), client=client, idempotency_max=2)
+    await adapter.start()
+
+    for oid in ("a", "b", "c"):
+        stream.dispatch(_event(type=EventType.ORDER_PAID, order_id=oid))
+        await _drain(adapter)
+
+    assert len(adapter._delivered_orders) == 2  # bounded to the cap
+    assert "a" not in adapter._delivered_orders  # oldest evicted
+    assert "b" in adapter._delivered_orders and "c" in adapter._delivered_orders
+    assert len(client.deliver_calls) == 3  # all three still delivered
+
+
+async def test_watchdog_does_not_trip_on_recoverable_drop():
+    # AC3: a recoverable drop (the SDK auto-reconnected, so `err()` stays None) is NOT treated as
+    # fatal — the watchdog polls, sees no error, and a clean signal-driven shutdown returns with
+    # no FatalProviderError. (The fatal-1008 trip is covered by the policy-violation test above;
+    # the SDK owns reconnect — Proov only relies on it + the watchdog.)
+    stream = FakeEventStream()  # err() returns None throughout (a healthy / recovered stream)
+    client = FakeClient(stream)
+    adapter = ProviderAdapter(_cfg(), client=client, watchdog_interval=0.01)
+
+    run_task = asyncio.create_task(adapter.run())
+    await _wait_until(lambda: bool(stream.on_calls))
+    # Let the watchdog poll a few times seeing a None err() (no fatal).
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert adapter.fatal_error is None
+    adapter.request_shutdown()
+    await asyncio.wait_for(run_task, timeout=2.0)
+    assert adapter.fatal_error is None  # a recovered drop never became fatal
+    assert stream.closed is True
+
+
+async def test_shutdown_drain_awaits_inflight_deliver(monkeypatch):
+    # AC4: an in-flight order task gated on an Event is AWAITED to completion within the drain
+    # budget — the live deliver finishes instead of being abandoned. Proven with a gated task,
+    # not a real wait.
+    import proov.engine as engine_mod
+
+    gate = asyncio.Event()
+    real_verify = engine_mod.verify
+
+    async def _gated_verify(inp, tier, **kwargs):
+        await gate.wait()
+        return await real_verify(inp, tier, **kwargs)
+
+    monkeypatch.setattr(engine_mod, "verify", _gated_verify)
+
+    stream = FakeEventStream()
+    client = FakeClient(stream)
+    adapter = ProviderAdapter(
+        _cfg(), client=client, watchdog_interval=10.0, shutdown_drain_seconds=5.0
+    )
+
+    run_task = asyncio.create_task(adapter.run())
+    await _wait_until(lambda: bool(stream.on_calls))
+    stream.dispatch(_event(type=EventType.ORDER_PAID, order_id="ord-drain"))
+    await _wait_until(lambda: bool(adapter._tasks))
+    assert adapter._tasks  # one in-flight task gated mid-verify
+
+    adapter.request_shutdown()  # run() reaches the drain and awaits the gated task
+    await asyncio.sleep(0)
+    gate.set()  # release it so it finishes WITHIN the drain budget
+    await asyncio.wait_for(run_task, timeout=2.0)
+
+    assert len(client.deliver_calls) == 1  # the in-flight deliver finished (not abandoned)
+    assert stream.closed is True and client.closed is True
+
+
+async def test_shutdown_drain_cancels_straggler(monkeypatch):
+    # AC4: a task that never completes is CANCELLED after a tiny drain budget — shutdown does not
+    # hang. Proven with a never-completing gated task + a tiny injected drain budget.
+    import proov.engine as engine_mod
+
+    never = asyncio.Event()
+
+    async def _hang_verify(inp, tier, **kwargs):
+        await never.wait()  # never set → the task never completes on its own
+
+    monkeypatch.setattr(engine_mod, "verify", _hang_verify)
+
+    stream = FakeEventStream()
+    client = FakeClient(stream)
+    adapter = ProviderAdapter(
+        _cfg(), client=client, watchdog_interval=10.0, shutdown_drain_seconds=0.05
+    )
+
+    run_task = asyncio.create_task(adapter.run())
+    await _wait_until(lambda: bool(stream.on_calls))
+    stream.dispatch(_event(type=EventType.ORDER_PAID, order_id="ord-hang"))
+    await _wait_until(lambda: bool(adapter._tasks))
+    inflight = next(iter(adapter._tasks))
+
+    adapter.request_shutdown()
+    await asyncio.wait_for(run_task, timeout=2.0)  # does NOT hang
+
+    assert inflight.cancelled()  # the straggler was cancelled after the budget
+    assert client.deliver_calls == []  # never delivered (was hung, then cancelled)
+    assert stream.closed is True and client.closed is True
+
+
+async def test_handle_order_paid_without_start_runs_without_throttle():
+    # AC1 defensive: a direct `_handle_order_paid` call that skipped `start()` (so `_sem` is
+    # None) must still deliver — `_verification_slot` degrades to no throttle rather than crash.
+    stream = FakeEventStream()
+    client = FakeClient(stream)
+    adapter = ProviderAdapter(_cfg(), client=client)  # NOTE: no start() → self._sem is None
+    assert adapter._sem is None
+
+    artifact = await adapter._handle_order_paid("ord-no-start")
+    assert artifact is not None
+    assert len(client.deliver_calls) == 1

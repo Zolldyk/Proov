@@ -9,12 +9,15 @@ arbitrary buyer URLs. Harness mirrors `tests/test_search.py` / `tests/test_llm.p
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 
 import httpx
 import pytest
 
+from proov import citations as cit
 from proov.citations import (
+    _MAX_FETCH_BYTES,
     _MAX_FETCH_CHARS,
     _DEFAULT_CITATION_TIMEOUT,
     _DEFAULT_USER_AGENT,
@@ -616,3 +619,73 @@ async def test_quick_ignores_discovered():
         )
     # Quick is provided-only — the discovered source is NOT listed.
     assert result == [CitationCheck("https://provided.example", True, True, "ok")]
+
+
+# ---------------------------------------------- per-source bounds (Story 3.3)
+
+
+async def test_per_source_total_bound_degrades_to_ok(monkeypatch):
+    # AC7: a source whose fetch+judge exceeds the per-source total-time wall is bounded by
+    # `asyncio.wait_for` → degraded to the non-crying-wolf `ok` (a timeout cannot prove
+    # `fabricated`), no judge spent. Proven by hanging `_fetch_source` under a tiny total budget.
+    never = asyncio.Event()
+
+    async def _hang_fetch(url, *, client=None, timeout):
+        await never.wait()  # never completes → the wait_for bound trips
+
+    monkeypatch.setattr(cit, "_fetch_source", _hang_fetch)
+    monkeypatch.setenv("PROOV_CITATION_TIMEOUT", "0.01")
+    monkeypatch.setenv("PROOV_LLM_TIMEOUT", "0.01")  # total = 0.02s
+
+    spy = _CitationJudgeSpy()
+    result = await check_citations(
+        "out", [{"url": "https://slow.example"}], "quick", provider=spy
+    )
+    assert result == [CitationCheck("https://slow.example", True, False, "ok")]
+    assert spy.calls == []  # the bound tripped before any judge call
+
+
+async def test_cancellederror_in_a_source_propagates(monkeypatch):
+    # AC7: `asyncio.CancelledError` raised in a source is genuine cancellation (a BaseException,
+    # distinct from the TimeoutError the wall raises) and must PROPAGATE — never degraded to `ok`.
+    async def _cancel_fetch(url, *, client=None, timeout):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(cit, "_fetch_source", _cancel_fetch)
+    spy = _CitationJudgeSpy()
+    with pytest.raises(asyncio.CancelledError):
+        await check_citations("out", [{"url": "https://x.example"}], "quick", provider=spy)
+
+
+async def test_fetch_source_oversize_content_length_is_ambiguous():
+    # AC7: a response whose body exceeds the byte cap → `ambiguous` (we cannot fairly judge a
+    # truncated giant), no full-body judge. httpx sets content-length from the body automatically.
+    big = b"x" * (_MAX_FETCH_BYTES + 10)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=big)
+
+    async with _mock_fetch_client(handler) as client:
+        result = await _fetch_source("https://big.example", client=client, timeout=1.0)
+    assert result == ("ambiguous", "")  # oversize → ambiguous, body NOT handed to the judge
+
+
+async def test_oversize_source_end_to_end_is_ok_not_fabricated():
+    # AC7 end-to-end: an oversize source degrades to a conservative `ok` (ambiguous → ok), never a
+    # false `fabricated`, and never spends a judge call on a multi-MB body.
+    spy = _CitationJudgeSpy()
+    big = b"x" * (_MAX_FETCH_BYTES + 10)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=big)
+
+    async with _mock_fetch_client(handler) as client:
+        result = await check_citations(
+            "the output",
+            [{"url": "https://big.example"}],
+            "quick",
+            provider=spy,
+            client=client,
+        )
+    assert result == [CitationCheck("https://big.example", False, False, "ok")]
+    assert spy.calls == []  # no judge spend on the oversize body

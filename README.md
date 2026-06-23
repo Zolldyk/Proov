@@ -13,24 +13,27 @@ A paid, callable CAP agent that verifies the factual claims in an AI-generated o
 The CAP transaction path (negotiate → pay → deliver → settle), the tamper-evident on-chain
 receipt, input validation and graceful degrade, and the full verification engine —
 claim extraction, evidence retrieval, per-claim judgment, citation check and deterministic
-verdict aggregation — are built and tested. As of Story 2.6 the **Quick Check** path runs
+verdict aggregation — are built and tested. The **Quick Check** path runs
 the whole engine end-to-end: a paid Quick order is verified single-pass and delivered as a
 real, schema-valid JSON deliverable whose `verdict`/`confidence`/`claims`/`citations_checked`/
 `stats` are the actual aggregated result, with the real model id in a fully populated,
-independently verifiable receipt. As of Story 2.7 the **Deep Verify** path is live: it runs
+independently verifiable receipt. The **Deep Verify** path is live: it runs
 the SAME pipeline keyed on `tier == "deep"` — multi-source evidence merge, multi-pass
 (self-consistency) judgment, provided+discovered citations and a 28-min SLA budget — and, for
 large reports, also delivers a downloadable full copy via `upload_file` + `get_download_url`
-linked from a `report_file` sibling, alongside the same independently verifiable receipt. As of
-Story 2.8 a repeated claim is served from a TTL'd SQLite **claim→evidence cache** with no new
-search-provider call — the cost/latency enabler of the $0-marginal model at volume. As of Story 3.1
-the engine is **calibrated to the ≥80%-precision bar** (NFR4, precision over recall): verdict
+linked from a `report_file` sibling, alongside the same independently verifiable receipt. A
+repeated claim is served from a TTL'd SQLite **claim→evidence cache** with no new
+search-provider call — the cost/latency enabler of the $0-marginal model at volume. The engine
+is **calibrated to the ≥80%-precision bar** (precision over recall): verdict
 precision is measured against a committed ~50-row hand-labeled set and gated offline, and the
 `fabricated` citation flag is tightened to fire only on a definitive 404/410 — no more false alarms
-on paywalled / rate-limited / transiently-down sources. As of Story 3.2 **order metrics are
+on paywalled / rate-limited / transiently-down sources. **Order metrics are
 instrumented**: the provider mirrors every terminal order into a best-effort SQLite ledger, and
 `scripts/dashboard.py` reconciles it with real `list_orders` to surface the success metrics and the
-**counter-metrics** (self-trade ratio, cost/order) that prove a win is real.
+**counter-metrics** (self-trade ratio, cost/order) that prove a win is real. The provider is
+**reliability-hardened**: a worker-pool bounds concurrent verifications within free-tier RPM,
+per-claim/per-order timeouts hold the SLA at slice granularity (degrading to an honest `partial`),
+and graceful shutdown drains in-flight settlements — so the completion rate holds under load.
 
 ## How it works
 
@@ -205,12 +208,12 @@ by both providers, plus the top-level `judge_claim` entrypoint.
   or the judge call fails — the claim degrades to `unverifiable` rather than risking a confident
   wrong verdict; one claim's failure never crashes a multi-claim order.
 
-### Citation check (Story 2.4)
+### Citation check
 
 When a buyer supplies `sources` with their output, `proov/citations.py` checks each provided
 source and flags it `ok` / `fabricated` / `misattributed` for the `citations_checked[]` field.
-This is the **provided-sources-only** path (Quick); Deep's "discovered sources" check lands in
-Story 2.7 (see **Deep Verify** below) — it appends the engine-surfaced evidence URLs flagged
+This is the **provided-sources-only** path (Quick); Deep's "discovered sources" check is
+covered under **Deep Verify** below — it appends the engine-surfaced evidence URLs flagged
 from their already-assigned stance, at zero extra fetch/judge cost.
 
 - **Two signals, one fetch.** Retrievability is a small injectable `httpx` GET of the source
@@ -222,62 +225,63 @@ from their already-assigned stance, at zero extra fetch/judge cost.
   `fabricated` (a **definitive** 404/410 — the source provably does not exist),
   `misattributed` (retrievable but positively refuted).
 - **Precision over recall (never cry wolf).** `fabricated` fires **only** on a confirmed-absent
-  source — a definitive 404/410 (it is the verdict-flipping flag the Story 2.5 `fail` rule keys
+  source — a definitive 404/410 (it is the verdict-flipping flag the `fail` rule keys
   on); a restricted / transient response (401/403/429/5xx, a timeout or DNS failure) is
-  **ambiguous → `ok`**, never a false `fabricated` (the Story 3.1 precision fix). `misattributed`
+  **ambiguous → `ok`**, never a false `fabricated`. `misattributed`
   fires **only** on a positive `unsupported` judgment — mere uncertainty (`unverifiable`, or
   content we couldn't read) is `ok` with support left unconfirmed. The check **never crashes a
   paid order**: a bad source degrades to a conservative non-fabricated `ok`.
 - **Config.** `PROOV_CITATION_TIMEOUT` (seconds, default 10) bounds the per-source fetch;
-  `PROOV_CITATION_USER_AGENT` (Story 3.1) overrides the browser-like fetch User-Agent; support
+  `PROOV_CITATION_USER_AGENT` overrides the browser-like fetch User-Agent; support
   reuses the existing LLM env. No new dependency.
 
-### Deterministic verdict (Story 2.5)
+### Deterministic verdict
 
-`proov/verdict.py` rolls the per-claim judgments (2.3) and per-source citation checks (2.4)
+`proov/verdict.py` rolls the per-claim judgments and per-source citation checks
 into a single aggregate `Verdict` — one `pass` / `fail` / `partial` label, an overall
-confidence, and the PRD §6 `stats` counts `{claims_total, supported, unsupported, unverifiable}`.
+confidence, and the `stats` counts `{claims_total, supported, unsupported, unverifiable}`.
 Unlike the network slices above, this module is **pure and synchronous** (no `croo`, no `httpx`,
 no async, no clock/RNG/env) — its template is `proov/receipt.py`.
 
-- **The FR10 rule** (evaluated in this precedence order):
+- **The verdict rule** (evaluated in this precedence order):
   - `fail` = ≥1 `fabricated` citation **or** ≥1 `unsupported` (refuted) claim.
   - `pass` = ≥1 claim, **all** `supported`, **no** `fabricated` citation, **no** `unverifiable`
     claim.
   - `partial` = everything else — including zero claims or any `unverifiable` claim (precision
     over recall: `pass` is reserved for a positively-verified output, never asserted on an
     empty or uncertain run).
-- **Misattributed citations have no v1 verdict effect** (Open Question 1, literal FR10): only
+- **Misattributed citations have no v1 verdict effect:** only
   `fabricated` gates the label; a `misattributed` source alongside all-`supported` claims still
-  yields `pass`. The precision-safe partial-demote alternative is a Story 3.1 calibration question.
+  yields `pass`. The precision-safe partial-demote alternative is a calibration question.
 - **Deterministic = load-bearing.** The verdict and confidence are hashed into the on-chain
-  receipt (Story 2.6 / CAP anchoring), so `aggregate_verdict` is a pure function of its inputs
+  receipt (CAP anchoring), so `aggregate_verdict` is a pure function of its inputs
   (same inputs ⇒ same bytes): the label uses commutative counting and the confidence is computed
   in stable list order.
 - **Confidence (v1)** is the mean of the per-claim confidences (a clamped `float`, `0.0` for
-  zero claims); the calibrated evidence-agreement + coverage formula is deferred to **Story 3.1**.
-- **Wiring** the `Verdict` into the delivered `verdict` / `confidence` / `stats` fields is
-  **Story 2.6** (Quick Check end-to-end); this slice only produces the value. No new dependency,
+  zero claims); a calibrated evidence-agreement + coverage formula is a later refinement (see
+  **Calibration to the precision bar**).
+- **Wiring** the `Verdict` into the delivered `verdict` / `confidence` / `stats` fields happens
+  in the Quick Check end-to-end path; this module only produces the value. No new dependency,
   no new env var.
 
-### Quick Check end-to-end (Story 2.6)
+### Quick Check end-to-end
 
-`proov/engine.py` is the SDK-agnostic `[B]` Verification Engine that finally ties the five
+`proov/engine.py` is the SDK-agnostic Verification Engine that finally ties the five
 slices above together: `verify(input, tier) -> Report` runs the full single-pass pipeline —
 **extract claims → (per claim) retrieve evidence + judge → check citations → aggregate
-verdict** — and the new `build_deliverable` (`proov/deliverable.py`) maps the resulting
-`Report` into a real PRD §6 deliverable + a real receipt. After this story a paid **Quick**
+verdict** — and `build_deliverable` (`proov/deliverable.py`) maps the resulting
+`Report` into a real deliverable + a real receipt. A paid **Quick**
 order returns a *real* `pass`/`fail`/`partial` verdict with confidence, a per-claim evidence
 trail, citation flags, stats and a tamper-evident on-chain receipt — no longer the stub.
 
 - **Single-pass, sequential.** v1 judges claims one at a time in extraction order (simplest,
   deterministic, and within the free-tier LLM RPM ceiling). Bounded-concurrency / a worker
-  pool is **Story 3.3**; the Deep multi-pass tier is **Story 2.7**.
+  pool is a later refinement; the Deep multi-pass tier is described under **Deep Verify**.
 - **Per-order SLA budget → honest early-stop.** A per-order deadline (`PROOV_QUICK_SLA_SECONDS`,
   default 240s — under the 5-min Quick SLA) is checked before each claim; if it is exceeded the
   loop stops early and aggregates whatever was judged into a real **`partial`** (degrade, don't
-  drop — NFR3), never a thrown error or an SLA timeout.
-- **Real model id (FR14).** The receipt now stamps the active LLM provider's model id
+  drop), never a thrown error or an SLA timeout.
+- **Real model id.** The receipt now stamps the active LLM provider's model id
   (`gemini-2.5-flash`, or `stub-llm` offline) instead of the old `stub-no-engine` placeholder —
   the engine resolves the provider once and injects it into both extraction and judgment so the
   stamped model is provably the one that judged.
@@ -286,7 +290,7 @@ trail, citation flags, stats and a tamper-evident on-chain receipt — no longer
   only a belt-and-suspenders backstop. No new dependency; one new env var
   (`PROOV_QUICK_SLA_SECONDS`).
 
-### Deep Verify (Story 2.7)
+### Deep Verify
 
 Deep Verify ($0.50, SLA <30 min) runs the **same** `verify(input, tier)` orchestration as
 Quick — extract → (per claim) retrieve + judge → check citations → aggregate → deliverable.
@@ -309,7 +313,7 @@ The tier is the only switch; the four Deep differentiators live **inside the sli
   (only buyer-provided citations can be `fabricated`/`misattributed`).
 - **28-min SLA budget.** `PROOV_DEEP_SLA_SECONDS` (default 1680s) bounds the whole pipeline, with
   the same honest early-stop → `partial` as Quick. (Bounded-concurrency to hit the wall on a
-  worst-case 50-claim order is **Story 3.3**; Deep still judges claims sequentially here.)
+  worst-case 50-claim order is a later refinement; Deep still judges claims sequentially here.)
 
 **Big-report delivery.** The verdict + receipt **always** deliver inline as the anchored,
 schema-valid deliverable. When a Deep deliverable's canonical bytes reach
@@ -324,12 +328,12 @@ paid order. `report_file` is added **after** the receipt is computed (like `rece
 No new dependency; three new env vars (`PROOV_DEEP_SLA_SECONDS`, `PROOV_DEEP_JUDGE_PASSES`,
 `PROOV_DEEP_UPLOAD_THRESHOLD_BYTES`).
 
-### Claim→evidence cache (Story 2.8)
+### Claim→evidence cache
 
-`proov/cache.py` adds a TTL'd, SQLite-backed **claim→evidence cache** `[E]`, wired transparently
+`proov/cache.py` adds a TTL'd, SQLite-backed **claim→evidence cache**, wired transparently
 into `retrieve_evidence` so the engine and both tiers get it for free. A repeated claim is served
 from cache with **zero** search-provider calls — the cost/latency enabler of the $0-marginal model
-at volume (FR11).
+at volume.
 
 - **Key = `(normalised claim, tier, k)`.** The claim text is lower-cased and whitespace-collapsed,
   then `sha256`-ed together with the tier and evidence count `k`. Including tier + `k` (not the bare
@@ -354,13 +358,14 @@ PROOV_CACHE_TTL_SECONDS=86400    # entry lifetime in seconds (24 h); garbage fal
 
 The test suite runs with caching **disabled** (an autouse fixture sets `PROOV_CACHE_ENABLED=0`), so
 no `proov_cache.db` is written and existing behaviour is unchanged. No new dependency (`sqlite3` is
-stdlib). The order/metrics ledger that will share this `[E]` slot is Story 3.2.
+stdlib). The order/metrics ledger shares this storage approach (see **Metrics + counter-metric
+dashboard**).
 
-### Calibration to the precision bar (Story 3.1)
+### Calibration to the precision bar
 
-Proov's promise is a **trustworthy** verifier: *"a verifier that cries wolf is worse than useless"*
-(PRD §1 / NFR4). Story 3.1 makes that measurable, reproducible, and gated — and tightens the one
-precision leak the earlier reviews deferred here.
+Proov's promise is a **trustworthy** verifier: *"a verifier that cries wolf is worse than useless"*.
+Proov makes that measurable, reproducible, and gated — and tightens the one
+precision leak earlier work deferred here.
 
 - **The ≥80% precision bar, precision over recall.** `proov/calibration.py` is a **pure**,
   deterministic scorer (built in the style of `proov/verdict.py` — no `croo`, no `httpx`, no I/O in
@@ -389,17 +394,18 @@ precision leak the earlier reviews deferred here.
   and `fabricated` precisions all clear 0.80, that every thin-evidence row resolves to
   `unverifiable` (100%), and that at least one flag class is below 1.0 (so the gate is meaningful).
 
-### Metrics + counter-metric dashboard (Story 3.2)
+### Metrics + counter-metric dashboard
 
 A win built on concentrated self-trade, or a tier that loses money at its price, is **not** a real
-win (PRD §1). So alongside the success metrics, Proov surfaces the **counter-metrics** that catch us
+win. So alongside the success metrics, Proov surfaces the **counter-metrics** that catch us
 "winning wrong" — and the whole thing reads **real order data**.
 
 - **Two metric kinds.** *Success:* total orders, completed, completion rate, unique buyer wallets
   (and **external** wallets), unique counterparties. *Counter-metrics:* **self-trade ratio**
   (own/companion orders ÷ all — external orders must dominate) and **cost / order** (must stay
-  ≈$0 marginal). The third PRD counter-metric, false-fail rate, is the Story 3.1 precision bar —
-  not re-done here. Every ratio is **undefined (`n/a`) on a zero denominator**, never a misleading
+  ≈$0 marginal). The third counter-metric, false-fail rate, is the precision bar (see
+  **Calibration to the precision bar**) — not re-done here. Every ratio is **undefined (`n/a`) on a
+  zero denominator**, never a misleading
   `0%` — an empty ledger does not report "0% complete".
 - **`list_orders` + a local SQLite ledger, reconciled.** Neither source alone is enough.
   `AgentClient.list_orders()` is the **authoritative** order truth — it sees the async `completed`
@@ -415,18 +421,58 @@ win (PRD §1). So alongside the success metrics, Proov surfaces the **counter-me
   always-on event loop, so it mirrors the cache's discipline: one lock-guarded connection,
   `asyncio.to_thread`-offloaded, every failure degrades to a no-op. The provider's record hook is
   **double-guarded** and runs only **after** an order is already terminal — it can never slow or
-  fail a paid order (NFR3).
+  fail a paid order.
 - **Run it.** `python scripts/dashboard.py` prints the dashboard **offline** from the local ledger —
   **$0, no keys, no network** (the ledger's snapshot status, honest except the `delivering→completed`
   lag). `python scripts/dashboard.py --live` instead reads real `list_orders` (provider role) and
   reconciles it with the ledger (live status wins; ledger supplies tier/cost) — operator-only, needs
   keys, never run by the test suite.
 - **Self-trade config.** `PROOV_OWN_AGENT_IDS` (comma-separated) marks Proov's own/companion agent
-  ids; until the companion Research caller's id is minted in Epic 4.2 it is empty and the self-trade
+  ids; until the companion Research caller's id is minted it is empty and the self-trade
   ratio is honestly `n/a`/`0%`. **$0 cost stance:** `cost / order` is the documented free-tier `0.0`
   today (overridable via `PROOV_QUICK_COST_USD` / `PROOV_DEEP_COST_USD`); a measured per-order cost
-  and a ceiling are Story 3.4 — this dashboard makes the $0-marginal claim **visible and falsifiable**
-  now.
+  and a ceiling are a later refinement — this dashboard makes the $0-marginal claim **visible and
+  falsifiable** now.
+
+### Reliability hardening (Story 3.3)
+
+A verifier that drops or times out paid orders under load is not trustworthy, no matter how good its
+verdicts are. So Proov holds its completion rate (PRD §1 DoD: **≥95%**) when the WebSocket drops or
+many orders arrive at once. Four pillars — every one a *bound* or a *degrade path*; the happy path is
+byte-for-byte unchanged, and the guiding rule is the carried **degrade, don't drop (NFR3)**:
+
+- **Auto-reconnect is owned by the SDK — Proov relies on it, doesn't reinvent it.** `croo`'s
+  `EventStream` already does the heartbeat + reconnect: a **ping every 30 s**, a **60 s
+  pong-timeout**, and **exponential backoff** capped at 30 s (`min(2**attempt, 30)`); registered
+  event handlers persist across a reconnect. The **one** case it does *not* reconnect is a
+  duplicate-SDK-key **WS 1008** (policy violation) — it records that in `err()` and stops. Proov's
+  watchdog polls `err()` and surfaces that single fatal case as a clean shutdown. Re-implementing
+  reconnect would only fight the SDK, so Proov doesn't. (A liveness probe for a *silent* death of the
+  SDK's background tasks stays deferred — `croo` 0.2.1 exposes no `is_connected()`/health method to
+  poll.)
+- **A worker-pool bounds concurrency within free-tier RPM.** A burst of `order_paid` events would
+  otherwise fire N concurrent verifications and blow Gemini's ~10 RPM / Tavily's quota. An
+  `asyncio.Semaphore(PROOV_MAX_CONCURRENT_ORDERS)` (default **3**) gates the LLM/search-heavy
+  verification stage, so at most that many run at once and the rest **queue** — no order is dropped
+  or rejected, the work is simply throttled (the sync handler still spawns a task per order; the
+  semaphore throttles the *work*, not the dispatch).
+- **Per-claim/per-order timeouts hold the SLA — degrade to `partial`.** Each evidence-retrieval and
+  judgment slice is bounded by the **remaining** SLA budget (not just checked at the top of the
+  loop), so a single slow claim — or a Deep claim's up-to-7 sequential self-consistency passes —
+  cannot overrun the 5-min / 30-min wall. A blown slice stops the run early and aggregates whatever
+  was judged into an honest **`partial`**, delivered *inside* the SLA window (instead of falling to a
+  platform SLA-timeout refund that would tank the completion rate). Genuine task cancellation still
+  propagates — only timeouts degrade.
+- **Graceful shutdown drains in-flight settlements.** On SIGINT/SIGTERM (or the fatal 1008), the
+  provider **drains** in-flight order tasks for up to `PROOV_SHUTDOWN_DRAIN_SECONDS` (default **25**)
+  before closing the socket — so a live `deliver_order`/`reject_order` (an on-chain settlement)
+  finishes rather than being abandoned. Stragglers past the budget are cancelled, then the WebSocket
+  closes normally (1000). The idempotency guards are also bounded (`PROOV_IDEMPOTENCY_MAX`, default
+  4096) and the best-effort SQLite cache/ledger are made concurrency-safe under the new pool (a cache
+  size-cap, `PROOV_CACHE_MAX_ROWS` default 10000, bounds the table too).
+
+All of this is proven **offline / $0**: injected gates and clocks, `httpx.MockTransport`, and SQLite
+`:memory:` — no real sockets, no wall-clock sleeps, no API spend.
 
 ## Input/output contract
 

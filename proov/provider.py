@@ -25,9 +25,11 @@ NFR3) rather than dropping the order to an SLA timeout. SLA-timeout refunds them
 platform-automatic — the provider never manually refunds.
 
 What this module does NOT do: reconnect/heartbeat (the SDK's `EventStream` owns those —
-30s ping, 60s pong-timeout, exponential backoff), real verification (Epic 2 — the verdict
-is still an explicit stub; only the receipt is real), per-order timeout enforcement (Epic 2
-/ Story 3.3), or worker-pool concurrency throttling (Epic 3 / Story 3.3).
+30s ping, 60s pong-timeout, exponential backoff capped at 30s; Proov only relies on it +
+the watchdog that surfaces the one fatal 1008). As of Story 3.3 it DOES bound concurrency
+(a worker-pool `asyncio.Semaphore` keeps simultaneous verifications under the free-tier RPM)
+and drains in-flight settlements on shutdown; the per-claim/per-order SLA bounds themselves
+live in the SDK-agnostic engine (`proov.engine`).
 
 Handlers are SYNCHRONOUS `Callable[[Event], None]` invoked from the SDK read-loop's
 dispatch — they must not block and must not be `async`. Real async work is offloaded via
@@ -39,6 +41,7 @@ delivered at most once (idempotent per id).
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import logging
 import os
@@ -48,6 +51,112 @@ from typing import Any
 from .config import AppConfig
 
 logger = logging.getLogger("proov.provider")
+
+# Story 3.3 reliability hardening — worker-pool concurrency, graceful drain, bounded idempotency.
+# Each numeric knob gets a local hardened resolver (the per-module idiom from
+# `engine._resolve_sla_seconds`): a missing / non-int / ≤0 value falls back to the default —
+# never a bare `int(os.environ[...])` that would crash on garbage.
+_DEFAULT_MAX_CONCURRENT_ORDERS = 3
+_DEFAULT_SHUTDOWN_DRAIN_SECONDS = 25.0
+_DEFAULT_IDEMPOTENCY_MAX = 4096
+
+
+def _resolve_max_concurrent_orders(raw: str | None = None) -> int:
+    """Resolve `PROOV_MAX_CONCURRENT_ORDERS`, tolerating garbage with the default (3).
+
+    The worker-pool size: at most this many orders run their LLM/search-heavy verification at
+    once (the rest queue), keeping concurrent verifications under the free-tier RPM
+    (architecture §3). A missing / non-int / ≤0 value → `_DEFAULT_MAX_CONCURRENT_ORDERS`.
+    """
+    raw = raw if raw is not None else os.environ.get("PROOV_MAX_CONCURRENT_ORDERS")
+    if raw is None:
+        return _DEFAULT_MAX_CONCURRENT_ORDERS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_CONCURRENT_ORDERS
+    if value <= 0:
+        return _DEFAULT_MAX_CONCURRENT_ORDERS
+    return value
+
+
+def _resolve_shutdown_drain_seconds(raw: str | None = None) -> float:
+    """Resolve `PROOV_SHUTDOWN_DRAIN_SECONDS`, tolerating garbage with the default (25 s).
+
+    The graceful-shutdown drain budget: in-flight order tasks (a live `deliver_order`/
+    `reject_order` settlement) are awaited up to this many seconds before the socket closes;
+    stragglers are then cancelled. A missing / non-numeric / non-finite / ≤0 value →
+    `_DEFAULT_SHUTDOWN_DRAIN_SECONDS`.
+    """
+    raw = raw if raw is not None else os.environ.get("PROOV_SHUTDOWN_DRAIN_SECONDS")
+    if raw is None:
+        return _DEFAULT_SHUTDOWN_DRAIN_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_SHUTDOWN_DRAIN_SECONDS
+    # NaN != itself; inf is unbounded — both would defeat a bounded drain.
+    if value != value or value in (float("inf"), float("-inf")) or value <= 0:
+        return _DEFAULT_SHUTDOWN_DRAIN_SECONDS
+    return value
+
+
+def _resolve_idempotency_max(raw: str | None = None) -> int:
+    """Resolve `PROOV_IDEMPOTENCY_MAX`, tolerating garbage with the default (4096).
+
+    The cap on each bounded idempotency guard (`_BoundedIdSet`): the most-recent N handled ids
+    are kept; older ids are evicted FIFO so memory stays bounded under sustained load. A missing
+    / non-int / ≤0 value → `_DEFAULT_IDEMPOTENCY_MAX`.
+    """
+    raw = raw if raw is not None else os.environ.get("PROOV_IDEMPOTENCY_MAX")
+    if raw is None:
+        return _DEFAULT_IDEMPOTENCY_MAX
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_IDEMPOTENCY_MAX
+    if value <= 0:
+        return _DEFAULT_IDEMPOTENCY_MAX
+    return value
+
+
+class _BoundedIdSet:
+    """A bounded FIFO 'ordered set' of ids — membership test + eviction-on-overflow (Story 3.3).
+
+    Backs the provider's idempotency guards (`_accepted_negotiations` / `_delivered_orders`),
+    which were plain `set()`s that never evicted (the Story 1.3 deferred unbounded-growth defect).
+    Keeps the most-recent `max_size` ids in insertion order (a `collections.OrderedDict` used as
+    an ordered set); `add` evicts the OLDEST id once the cap is exceeded. `__contains__` / `add`
+    / `discard` preserve the exact set semantics the call sites rely on (add-before-await,
+    discard-on-transient-rollback) — only an eviction-on-overflow is added.
+
+    Trade-off (documented): a re-emitted event for an id evicted past the cap (only after
+    `max_size` newer ids) could be re-handled, but that is mitigated by the platform's order
+    idempotency and is far past hackathon volume (~10–100 orders).
+    """
+
+    def __init__(self, max_size: int) -> None:
+        self._max_size = max_size
+        self._ids: "collections.OrderedDict[str, None]" = collections.OrderedDict()
+
+    def __contains__(self, id_: str) -> bool:
+        return id_ in self._ids
+
+    def add(self, id_: str) -> None:
+        # Re-adding moves it to the most-recent end (so a churned-but-live id is not evicted).
+        if id_ in self._ids:
+            self._ids.move_to_end(id_)
+        else:
+            self._ids[id_] = None
+        # Evict oldest first while over the cap (cap ≥ 1 guaranteed by the resolver).
+        while len(self._ids) > self._max_size:
+            self._ids.popitem(last=False)
+
+    def discard(self, id_: str) -> None:
+        self._ids.pop(id_, None)
+
+    def __len__(self) -> int:
+        return len(self._ids)
 
 # Deep big-report delivery (Story 2.7): a Deep deliverable whose canonical bytes reach this
 # threshold is ALSO uploaded via `upload_file` and linked by a `report_file` sibling. 50 KB
@@ -93,21 +202,47 @@ class ProviderAdapter:
         client: Any | None = None,
         watchdog_interval: float = 5.0,
         close_timeout: float = 10.0,
+        max_concurrent_orders: int | None = None,
+        shutdown_drain_seconds: float | None = None,
+        idempotency_max: int | None = None,
     ) -> None:
         self._cfg = cfg
         # `client` is injectable for unit tests; built from config on start() otherwise.
         self._client = client
         self._watchdog_interval = watchdog_interval
         self._close_timeout = close_timeout
+        # Story 3.3 reliability knobs — constructor-injectable for deterministic tests, else
+        # resolved from env via the hardened resolvers (garbage → default).
+        self._max_concurrent_orders = (
+            max_concurrent_orders
+            if max_concurrent_orders is not None and max_concurrent_orders > 0
+            else _resolve_max_concurrent_orders()
+        )
+        self._shutdown_drain_seconds = (
+            shutdown_drain_seconds
+            if shutdown_drain_seconds is not None and shutdown_drain_seconds > 0
+            else _resolve_shutdown_drain_seconds()
+        )
+        idempotency_cap = (
+            idempotency_max
+            if idempotency_max is not None and idempotency_max > 0
+            else _resolve_idempotency_max()
+        )
         self._stream: Any | None = None
         self._shutdown = asyncio.Event()
         self._fatal_error: BaseException | None = None
         self._signals_installed = False
-        # Idempotency guards: a negotiation is accepted at most once and an order
-        # delivered at most once. Ids are added on first dispatch (before the await) so
-        # a duplicate event that arrives while the first is still in flight is skipped.
-        self._accepted_negotiations: set[str] = set()
-        self._delivered_orders: set[str] = set()
+        # The worker-pool semaphore (Story 3.3) is created in `start()` on the RUNNING loop, not
+        # here — an `asyncio.Semaphore` binds to the loop active at construction, which is not
+        # necessarily the run loop. `None` until `start()`; `_verification_slot` degrades to no
+        # throttle if a test calls `_handle_order_paid` without `start()`.
+        self._sem: asyncio.Semaphore | None = None
+        # Idempotency guards: a negotiation is accepted at most once and an order delivered at
+        # most once. Ids are added on first dispatch (before the await) so a duplicate event that
+        # arrives while the first is still in flight is skipped. Bounded FIFO (Story 3.3) so they
+        # cannot grow without bound under sustained load.
+        self._accepted_negotiations = _BoundedIdSet(idempotency_cap)
+        self._delivered_orders = _BoundedIdSet(idempotency_cap)
         # Hold references to dispatched tasks so Python can't GC a still-pending task
         # ("Task was destroyed but it is pending"); each task removes itself on done.
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -135,6 +270,12 @@ class ProviderAdapter:
         if self._client is None:
             self._client = self._build_client()
 
+        # Story 3.3 worker-pool: create the concurrency semaphore on the RUNNING loop (here, not
+        # __init__) so it binds to the right loop. It throttles the verification WORK, not the
+        # event dispatch — the sync handler still spawns a task per order; at most
+        # `max_concurrent_orders` are in their LLM/search-heavy stage at once, the rest queue.
+        self._sem = asyncio.Semaphore(self._max_concurrent_orders)
+
         # connect_websocket() is async, returns an EventStream, and raises ValueError
         # if ws_url is empty. The SDK's read-loop + ping-loop start as background tasks.
         self._stream = await self._client.connect_websocket()
@@ -154,6 +295,25 @@ class ProviderAdapter:
         task = asyncio.create_task(coro, name=name)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    @contextlib.asynccontextmanager
+    async def _verification_slot(self):
+        """Bound the verification+terminal section to the worker-pool semaphore (Story 3.3).
+
+        Acquires `self._sem` (created in `start()` on the run loop) so at most
+        `max_concurrent_orders` orders are in their LLM/search-heavy verification stage at once;
+        excess order tasks queue here, keeping concurrent verifications under the free-tier RPM
+        (architecture §3). `async with` releases the slot on EVERY exit — success, early `return`,
+        or exception. Acquired AFTER the fast malformed-input reject path, so a cheap reject never
+        consumes a heavy slot. Defensive: if `_sem` is unset (a direct `_handle_order_paid` call
+        that skipped `start()`), runs WITHOUT a throttle rather than crashing.
+        """
+        sem = self._sem
+        if sem is None:
+            yield
+            return
+        async with sem:
+            yield
 
     # --- handlers (SYNC, must not block) ---------------------------------------
 
@@ -311,150 +471,155 @@ class ProviderAdapter:
             # We must NOT fall to the outer `except` (which rolls back the idempotency guard
             # → poison-message redelivery loop). The honest terminal action is reject_order
             # (escrow auto-refunds the requester), exactly like the malformed-input path.
-            try:
+            # Story 3.3 worker-pool: the verification + terminal section (verify → build →
+            # deliver/reject) runs inside the concurrency semaphore, so at most
+            # `max_concurrent_orders` orders are in their LLM/search-heavy stage at once; the
+            # rest queue. `async with` always releases the slot (success / return / raise).
+            async with self._verification_slot():
                 try:
-                    report = await engine_mod.verify(result.value, tier)
-                    payload = deliverable_mod.build_deliverable(
-                        order, tier, output_text=output_text, report=report
-                    )
-                except Exception as build_exc:
-                    logger.exception(
-                        "verification/build failed for order %s; delivering graceful "
-                        "unverifiable report (degrade, don't drop): %s",
-                        order_id,
-                        build_exc,
-                    )
-                    payload = build_graceful_deliverable(
-                        order,
-                        tier,
-                        output_text=output_text,
-                        reason="internal_verification_error",
-                    )
-                # Deliver CANONICAL bytes: the CAP backend anchors keccak256 of the EXACT
-                # POSTed string, and `get_delivery` returns a re-ordered copy — so a verifier
-                # can only reproduce `content_hash` by re-canonicalising. Delivering canonical
-                # JSON makes that round-trip exact. (Story 1.4 Task 1 empirical finding.)
-                deliverable_schema = canonical_json(payload)
-
-                # Story 2.7 — Deep big-report delivery. When a DEEP deliverable's canonical
-                # bytes reach the threshold, ALSO upload those EXACT bytes as a downloadable
-                # full copy and link them via a `report_file` sibling. The uploaded bytes are
-                # the artifact whose `report_hash` the file reproduces; `report_file` is added
-                # AFTER `build_deliverable` computed the receipt, so it is a post-receipt
-                # sibling (like `receipt`/`verified_by_proov`) and does NOT change `report_hash`
-                # — only the whole-deliverable `content_hash` covers it. Best-effort in its OWN
-                # try/except: any upload error degrades to inline delivery WITHOUT `report_file`
-                # (the file is a convenience download, never the verdict — an upload hiccup must
-                # not drop a paid order). Quick and sub-threshold Deep (incl. the small
-                # graceful-degrade deliverable) never reach the upload call.
-                canonical_bytes = deliverable_schema.encode("utf-8")
-                if tier == "deep" and len(canonical_bytes) >= _resolve_upload_threshold():
                     try:
-                        object_key = await self._client.upload_file(
-                            f"proov-report-{order_id}.json", canonical_bytes
+                        report = await engine_mod.verify(result.value, tier)
+                        payload = deliverable_mod.build_deliverable(
+                            order, tier, output_text=output_text, report=report
                         )
-                        download_url = await self._client.get_download_url(object_key)
-                        payload_with_file = {
-                            **payload,
-                            "report_file": {
-                                "object_key": object_key,
-                                "download_url": download_url,
-                                "size_bytes": len(canonical_bytes),
-                            },
-                        }
-                        deliverable_schema = canonical_json(payload_with_file)
-                        payload = payload_with_file
-                    except Exception as upload_exc:  # noqa: BLE001
-                        # Degrade, don't drop: keep the original inline `deliverable_schema`
-                        # (no `report_file`). `asyncio.CancelledError` is a BaseException and is
-                        # NOT caught here, so task cancellation still propagates.
-                        logger.warning(
-                            "report upload failed for order %s; delivering inline without "
-                            "report_file (degrade, don't drop): %r",
+                    except Exception as build_exc:
+                        logger.exception(
+                            "verification/build failed for order %s; delivering graceful "
+                            "unverifiable report (degrade, don't drop): %s",
                             order_id,
-                            upload_exc,
+                            build_exc,
                         )
-            except Exception as fatal_build_exc:
-                # Could not build/serialise a deliverable even after the graceful degrade —
-                # reject so escrow refunds, and mark terminal so a re-emit does not retry the
-                # same deterministic failure forever (poison message).
-                await self._client.reject_order(order_id, "internal_verification_error")
-                terminal = True
-                # Story 3.2: record this terminal (rejected) order best-effort.
-                await self._record_order(order, tier, "rejected")
-                logger.exception(
-                    "rejected paid order (escrow refund) — could not build/serialise a "
-                    "deliverable even after graceful degrade: order_id=%s: %s",
-                    order_id,
-                    fatal_build_exc,
-                )
-                return
-            req = DeliverOrderRequest(
-                deliverable_type=DeliverableType.SCHEMA,
-                deliverable_schema=deliverable_schema,
-            )
-            delivery_result = await self._client.deliver_order(order_id, req)
-            terminal = True  # anchored on-chain — never roll back the guard now
-            delivered = getattr(delivery_result, "order", None)
-            delivery = getattr(delivery_result, "delivery", None)
-            content_hash = getattr(delivery, "content_hash", None)
-            logger.info(
-                "order delivered: order_id=%s tier=%s status=%s tx_hash=%s "
-                "delivery_id=%s content_hash=%s",
-                order_id,
-                tier,
-                getattr(delivered, "status", None),  # live: "delivering" (CLEAR is async)
-                getattr(delivery_result, "tx_hash", None),
-                getattr(delivery, "delivery_id", None),
-                content_hash,  # on-chain anchor (Story 1.4)
-            )
-            # Per-order evidence line so the on-chain receipt anchor is captured in logs.
-            logger.info(
-                "receipt anchored: order_id=%s content_hash=%s output_hash=%s",
-                order_id,
-                content_hash,
-                payload["receipt"]["output_hash"],
-            )
-            # Story 3.2: mirror this terminal order into the metrics ledger (best-effort, in its
-            # OWN try/except, AFTER the order is anchored on-chain). The full counterparty/wallet/
-            # price come from `order` (the get_order result), while the status is the freshest
-            # delivery-time snapshot ("delivering" — CLEAR is async); the dashboard's list_orders
-            # reconciliation supplies the live "completed" later.
-            await self._record_order(
-                order, tier, getattr(delivered, "status", "") or "delivering"
-            )
-            # Story 1.6: assemble the post-delivery, tx-bearing "Verified by Proov" artifact
-            # (FR16) from data already in hand — the receipt + the now-known on-chain anchor.
-            # DEFENSIVE: its own try/except (log-and-swallow). The order is already terminal
-            # (anchored on-chain); a formatting/field error here must NOT trip the outer
-            # `except` — that would log a misleading "failed to deliver" — nor (though
-            # `terminal` already guards it) roll back the idempotency guard. Returned so the
-            # Epic 4 caller can attach it to its own delivery.
-            try:
-                from .badge import build_anchor, build_verified_artifact
+                        payload = build_graceful_deliverable(
+                            order,
+                            tier,
+                            output_text=output_text,
+                            reason="internal_verification_error",
+                        )
+                    # Deliver CANONICAL bytes: the CAP backend anchors keccak256 of the EXACT
+                    # POSTed string, and `get_delivery` returns a re-ordered copy — so a verifier
+                    # can only reproduce `content_hash` by re-canonicalising. Delivering canonical
+                    # JSON makes that round-trip exact. (Story 1.4 Task 1 empirical finding.)
+                    deliverable_schema = canonical_json(payload)
 
-                anchor = build_anchor(
-                    order_id=order_id,
-                    content_hash=content_hash,
-                    deliver_tx_hash=getattr(delivery_result, "tx_hash", None)
-                    or getattr(delivered, "deliver_tx_hash", None),
-                    delivery_id=getattr(delivery, "delivery_id", None),
+                    # Story 2.7 — Deep big-report delivery. When a DEEP deliverable's canonical
+                    # bytes reach the threshold, ALSO upload those EXACT bytes as a downloadable
+                    # full copy and link them via a `report_file` sibling. The uploaded bytes are
+                    # the artifact whose `report_hash` the file reproduces; `report_file` is added
+                    # AFTER `build_deliverable` computed the receipt, so it is a post-receipt
+                    # sibling (like `receipt`/`verified_by_proov`) and does NOT change `report_hash`
+                    # — only the whole-deliverable `content_hash` covers it. Best-effort in its OWN
+                    # try/except: any upload error degrades to inline delivery WITHOUT `report_file`
+                    # (the file is a convenience download, never the verdict — an upload hiccup must
+                    # not drop a paid order). Quick and sub-threshold Deep (incl. the small
+                    # graceful-degrade deliverable) never reach the upload call.
+                    canonical_bytes = deliverable_schema.encode("utf-8")
+                    if tier == "deep" and len(canonical_bytes) >= _resolve_upload_threshold():
+                        try:
+                            object_key = await self._client.upload_file(
+                                f"proov-report-{order_id}.json", canonical_bytes
+                            )
+                            download_url = await self._client.get_download_url(object_key)
+                            payload_with_file = {
+                                **payload,
+                                "report_file": {
+                                    "object_key": object_key,
+                                    "download_url": download_url,
+                                    "size_bytes": len(canonical_bytes),
+                                },
+                            }
+                            deliverable_schema = canonical_json(payload_with_file)
+                            payload = payload_with_file
+                        except Exception as upload_exc:  # noqa: BLE001
+                            # Degrade, don't drop: keep the original inline `deliverable_schema`
+                            # (no `report_file`). `asyncio.CancelledError` is a BaseException and is
+                            # NOT caught here, so task cancellation still propagates.
+                            logger.warning(
+                                "report upload failed for order %s; delivering inline without "
+                                "report_file (degrade, don't drop): %r",
+                                order_id,
+                                upload_exc,
+                            )
+                except Exception as fatal_build_exc:
+                    # Could not build/serialise a deliverable even after the graceful degrade —
+                    # reject so escrow refunds, and mark terminal so a re-emit does not retry the
+                    # same deterministic failure forever (poison message).
+                    await self._client.reject_order(order_id, "internal_verification_error")
+                    terminal = True
+                    # Story 3.2: record this terminal (rejected) order best-effort.
+                    await self._record_order(order, tier, "rejected")
+                    logger.exception(
+                        "rejected paid order (escrow refund) — could not build/serialise a "
+                        "deliverable even after graceful degrade: order_id=%s: %s",
+                        order_id,
+                        fatal_build_exc,
+                    )
+                    return
+                req = DeliverOrderRequest(
+                    deliverable_type=DeliverableType.SCHEMA,
+                    deliverable_schema=deliverable_schema,
                 )
-                artifact = build_verified_artifact(payload["receipt"], anchor=anchor)
+                delivery_result = await self._client.deliver_order(order_id, req)
+                terminal = True  # anchored on-chain — never roll back the guard now
+                delivered = getattr(delivery_result, "order", None)
+                delivery = getattr(delivery_result, "delivery", None)
+                content_hash = getattr(delivery, "content_hash", None)
                 logger.info(
-                    "verified-by-proov artifact: order_id=%s %s",
+                    "order delivered: order_id=%s tier=%s status=%s tx_hash=%s "
+                    "delivery_id=%s content_hash=%s",
                     order_id,
-                    canonical_json(artifact),
+                    tier,
+                    getattr(delivered, "status", None),  # live: "delivering" (CLEAR is async)
+                    getattr(delivery_result, "tx_hash", None),
+                    getattr(delivery, "delivery_id", None),
+                    content_hash,  # on-chain anchor (Story 1.4)
                 )
-                return artifact
-            except Exception as artifact_exc:  # pragma: no cover - defensive log-and-swallow
-                logger.exception(
-                    "failed to assemble verified-by-proov artifact for delivered order "
-                    "%s (delivery already anchored — not a delivery failure): %s",
+                # Per-order evidence line so the on-chain receipt anchor is captured in logs.
+                logger.info(
+                    "receipt anchored: order_id=%s content_hash=%s output_hash=%s",
                     order_id,
-                    artifact_exc,
+                    content_hash,
+                    payload["receipt"]["output_hash"],
                 )
-                return None
+                # Story 3.2: mirror this terminal order into the metrics ledger (best-effort, in its
+                # OWN try/except, AFTER the order is anchored on-chain). The full counterparty/wallet/
+                # price come from `order` (the get_order result), while the status is the freshest
+                # delivery-time snapshot ("delivering" — CLEAR is async); the dashboard's list_orders
+                # reconciliation supplies the live "completed" later.
+                await self._record_order(
+                    order, tier, getattr(delivered, "status", "") or "delivering"
+                )
+                # Story 1.6: assemble the post-delivery, tx-bearing "Verified by Proov" artifact
+                # (FR16) from data already in hand — the receipt + the now-known on-chain anchor.
+                # DEFENSIVE: its own try/except (log-and-swallow). The order is already terminal
+                # (anchored on-chain); a formatting/field error here must NOT trip the outer
+                # `except` — that would log a misleading "failed to deliver" — nor (though
+                # `terminal` already guards it) roll back the idempotency guard. Returned so the
+                # Epic 4 caller can attach it to its own delivery.
+                try:
+                    from .badge import build_anchor, build_verified_artifact
+
+                    anchor = build_anchor(
+                        order_id=order_id,
+                        content_hash=content_hash,
+                        deliver_tx_hash=getattr(delivery_result, "tx_hash", None)
+                        or getattr(delivered, "deliver_tx_hash", None),
+                        delivery_id=getattr(delivery, "delivery_id", None),
+                    )
+                    artifact = build_verified_artifact(payload["receipt"], anchor=anchor)
+                    logger.info(
+                        "verified-by-proov artifact: order_id=%s %s",
+                        order_id,
+                        canonical_json(artifact),
+                    )
+                    return artifact
+                except Exception as artifact_exc:  # pragma: no cover - defensive log-and-swallow
+                    logger.exception(
+                        "failed to assemble verified-by-proov artifact for delivered order "
+                        "%s (delivery already anchored — not a delivery failure): %s",
+                        order_id,
+                        artifact_exc,
+                    )
+                    return None
         except Exception as exc:
             # Roll back the guard ONLY if the order is not yet terminal, so a transient
             # failure can retry on a re-emit. Once deliver_order OR reject_order succeeded,
@@ -562,11 +727,49 @@ class ProviderAdapter:
                 watchdog.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await watchdog
+            # Story 3.3: drain in-flight order tasks BEFORE closing the socket, so an in-flight
+            # `deliver_order`/`reject_order` (a live on-chain settlement) finishes instead of
+            # being abandoned (the Story 1.3 deferred half-delivery defect). Runs on BOTH the
+            # clean-signal and fatal-error (watchdog 1008) shutdown paths — both set `_shutdown`,
+            # so both reach here. Inside the outer try so `_aclose` (outer finally) still runs.
+            await self._drain_tasks()
         finally:
             await self._aclose()
 
         if self._fatal_error is not None:
             raise self._fatal_error
+
+    async def _drain_tasks(self) -> None:
+        """Await in-flight order tasks (bounded), cancelling stragglers, before the socket closes.
+
+        On shutdown, snapshot the dispatched tasks (`add_done_callback` mutates `_tasks` as each
+        finishes, so iterate a copy) and `asyncio.wait` them up to `PROOV_SHUTDOWN_DRAIN_SECONDS`
+        — letting an in-flight `deliver_order`/`reject_order` (a live on-chain settlement) finish
+        rather than being abandoned. Any task still pending after the drain budget is cancelled
+        and awaited (suppressing `CancelledError`) so nothing is left dangling. The order tasks
+        themselves never raise out (they log-and-swallow internally), so the drain is a clean
+        best-effort step.
+        """
+        tasks = list(self._tasks)
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(tasks, timeout=self._shutdown_drain_seconds)
+        if not pending:
+            logger.info("shutdown drain: all %d in-flight task(s) finished", len(done))
+            return
+        logger.warning(
+            "shutdown drain: %d task(s) finished, cancelling %d still pending after %ss",
+            len(done),
+            len(pending),
+            self._shutdown_drain_seconds,
+        )
+        for task in pending:
+            task.cancel()
+        # Await the cancellations so nothing is left dangling; suppress the CancelledError each
+        # raises (the genuine cancellation we just requested).
+        for task in pending:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     async def _watchdog(self) -> None:
         """Poll `stream.err()`; on a non-None error, record it and trigger shutdown."""
