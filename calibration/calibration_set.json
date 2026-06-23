@@ -1,0 +1,502 @@
+{
+  "_about": "Proov calibration set (Story 3.1, NFR4). ~50 hand-labeled rows — a COMMITTED product artifact, not test-only. Two row kinds: 'claim' rows carry the retrieved 'evidence' + the raw 'recorded_judgment' the live model returned (captured via `python scripts/calibrate.py --live`) and a 'gold_status'; 'citation' rows carry a 'recorded_fetch' (the HTTP/transport outcome) + optional 'recorded_support_status' and a 'gold_flag'. The offline replay (scripts/calibrate.py + tests/test_calibration.py) feeds the recorded_* fields through the REAL deterministic engine (_normalise_judgment / _classify_retrievability / _flag_for) to reproduce a prediction with NO network and NO spend. The set is deliberately HONEST: it seeds a small number of real model errors so measured precision is < 1.0 but >= 0.80 on the flagged classes (proving the bar is a real threshold, not a tautology).",
+  "expected": {
+    "threshold": 0.80,
+    "pooled_flag_precision": "0.90 (9/10)",
+    "unsupported_precision": "0.833 (5/6) — below 1.0 by one honest false-flag (claim-unsup-fp-01); the meaningful-gate guard",
+    "fabricated_precision": "1.00 (4/4) — only definitive 404/410 are flagged fabricated; the precision fix removed the old transient-5xx false positives (now ok)",
+    "thin_evidence_unverifiable_rate": "1.00 (8/8) — every thin row resolves to unverifiable (anti-guess guard)",
+    "note": "The 5 ambiguous citation rows (403/429/503/500/timeout) are gold 'ok'; the OLD code mis-flagged them 'fabricated' (5 false positives). The new 404/410-only rule is what lifts fabricated-flag precision."
+  },
+  "rows": [
+    {
+      "id": "claim-sup-01",
+      "kind": "claim",
+      "claim": "The Eiffel Tower is located in Paris, France.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Eiffel_Tower", "title": "Eiffel Tower", "snippet": "The Eiffel Tower is a wrought-iron lattice tower on the Champ de Mars in Paris, France.", "score": 0.96}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.95, "evidence": [{"source": "https://en.wikipedia.org/wiki/Eiffel_Tower", "quote": "a wrought-iron lattice tower on the Champ de Mars in Paris, France", "stance": "supports"}]},
+      "gold_status": "supported"
+    },
+    {
+      "id": "claim-sup-02",
+      "kind": "claim",
+      "claim": "Water boils at 100 degrees Celsius at sea level.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Boiling_point", "title": "Boiling point", "snippet": "At standard atmospheric pressure (sea level), water boils at 100 degrees Celsius.", "score": 0.93}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.94, "evidence": [{"source": "https://en.wikipedia.org/wiki/Boiling_point", "quote": "water boils at 100 degrees Celsius", "stance": "supports"}]},
+      "gold_status": "supported"
+    },
+    {
+      "id": "claim-sup-03",
+      "kind": "claim",
+      "claim": "The Great Wall of China is located in China.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Great_Wall_of_China", "title": "Great Wall of China", "snippet": "The Great Wall of China is a series of fortifications built across the historical northern borders of ancient Chinese states.", "score": 0.95}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.93, "evidence": [{"source": "https://en.wikipedia.org/wiki/Great_Wall_of_China", "quote": "built across the historical northern borders of ancient Chinese states", "stance": "supports"}]},
+      "gold_status": "supported"
+    },
+    {
+      "id": "claim-sup-04",
+      "kind": "claim",
+      "claim": "Mount Everest is the highest mountain above sea level.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Mount_Everest", "title": "Mount Everest", "snippet": "Mount Everest is Earth's highest mountain above sea level, located in the Mahalangur Himal sub-range of the Himalayas.", "score": 0.96}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.96, "evidence": [{"source": "https://en.wikipedia.org/wiki/Mount_Everest", "quote": "Earth's highest mountain above sea level", "stance": "supports"}]},
+      "gold_status": "supported"
+    },
+    {
+      "id": "claim-sup-05",
+      "kind": "claim",
+      "claim": "The speed of light in vacuum is about 299,792 kilometres per second.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Speed_of_light", "title": "Speed of light", "snippet": "The speed of light in vacuum is exactly 299,792,458 metres per second (about 299,792 km/s).", "score": 0.92}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.95, "evidence": [{"source": "https://en.wikipedia.org/wiki/Speed_of_light", "quote": "299,792,458 metres per second", "stance": "supports"}]},
+      "gold_status": "supported"
+    },
+    {
+      "id": "claim-sup-06",
+      "kind": "claim",
+      "claim": "The human heart has four chambers.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Heart", "title": "Heart", "snippet": "The human heart has four chambers: two upper atria and two lower ventricles.", "score": 0.94}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.95, "evidence": [{"source": "https://en.wikipedia.org/wiki/Heart", "quote": "four chambers: two upper atria and two lower ventricles", "stance": "supports"}]},
+      "gold_status": "supported"
+    },
+    {
+      "id": "claim-sup-07",
+      "kind": "claim",
+      "claim": "Photosynthesis occurs in the chloroplasts of plant cells.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Photosynthesis", "title": "Photosynthesis", "snippet": "In plants, photosynthesis takes place in chloroplasts, which contain the chlorophyll.", "score": 0.91}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.92, "evidence": [{"source": "https://en.wikipedia.org/wiki/Photosynthesis", "quote": "photosynthesis takes place in chloroplasts", "stance": "supports"}]},
+      "gold_status": "supported"
+    },
+    {
+      "id": "claim-sup-08",
+      "kind": "claim",
+      "claim": "The Pacific Ocean is the largest ocean on Earth.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Pacific_Ocean", "title": "Pacific Ocean", "snippet": "The Pacific Ocean is the largest and deepest of Earth's five oceanic divisions.", "score": 0.95}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.96, "evidence": [{"source": "https://en.wikipedia.org/wiki/Pacific_Ocean", "quote": "the largest and deepest of Earth's five oceanic divisions", "stance": "supports"}]},
+      "gold_status": "supported"
+    },
+    {
+      "id": "claim-sup-09",
+      "kind": "claim",
+      "claim": "William Shakespeare wrote the play Hamlet.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Hamlet", "title": "Hamlet", "snippet": "Hamlet is a tragedy written by William Shakespeare sometime between 1599 and 1601.", "score": 0.94}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.95, "evidence": [{"source": "https://en.wikipedia.org/wiki/Hamlet", "quote": "a tragedy written by William Shakespeare", "stance": "supports"}]},
+      "gold_status": "supported"
+    },
+    {
+      "id": "claim-sup-10",
+      "kind": "claim",
+      "claim": "The chemical symbol for gold is Au.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Gold", "title": "Gold", "snippet": "Gold is a chemical element with the symbol Au (from Latin aurum) and atomic number 79.", "score": 0.93}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.97, "evidence": [{"source": "https://en.wikipedia.org/wiki/Gold", "quote": "the symbol Au (from Latin aurum)", "stance": "supports"}]},
+      "gold_status": "supported"
+    },
+    {
+      "id": "claim-sup-11",
+      "kind": "claim",
+      "claim": "The Amazon River is in South America.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Amazon_River", "title": "Amazon River", "snippet": "The Amazon River in South America is the largest river by discharge volume of water in the world.", "score": 0.94}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.95, "evidence": [{"source": "https://en.wikipedia.org/wiki/Amazon_River", "quote": "The Amazon River in South America", "stance": "supports"}]},
+      "gold_status": "supported"
+    },
+    {
+      "id": "claim-sup-12",
+      "kind": "claim",
+      "claim": "DNA carries genetic information in living organisms.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/DNA", "title": "DNA", "snippet": "DNA is a polymer that carries genetic instructions for the development, functioning, growth and reproduction of all known organisms.", "score": 0.92}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.93, "evidence": [{"source": "https://en.wikipedia.org/wiki/DNA", "quote": "carries genetic instructions for the development, functioning, growth and reproduction", "stance": "supports"}]},
+      "gold_status": "supported"
+    },
+    {
+      "id": "claim-sup-13",
+      "kind": "claim",
+      "claim": "The Moon orbits the Earth.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Moon", "title": "Moon", "snippet": "The Moon is Earth's only natural satellite and orbits the Earth at an average distance of 384,400 km.", "score": 0.95}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.96, "evidence": [{"source": "https://en.wikipedia.org/wiki/Moon", "quote": "Earth's only natural satellite and orbits the Earth", "stance": "supports"}]},
+      "gold_status": "supported"
+    },
+    {
+      "id": "claim-sup-14",
+      "kind": "claim",
+      "claim": "Mercury is the closest planet to the Sun.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Mercury_(planet)", "title": "Mercury", "snippet": "Mercury is the first planet from the Sun and the smallest in the Solar System.", "score": 0.93}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.94, "evidence": [{"source": "https://en.wikipedia.org/wiki/Mercury_(planet)", "quote": "the first planet from the Sun", "stance": "supports"}]},
+      "gold_status": "supported"
+    },
+    {
+      "id": "claim-sup-15",
+      "kind": "claim",
+      "claim": "The Sahara is the largest hot desert in the world.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Sahara", "title": "Sahara", "snippet": "The Sahara is the largest hot desert in the world and the third-largest desert overall.", "score": 0.94}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.95, "evidence": [{"source": "https://en.wikipedia.org/wiki/Sahara", "quote": "the largest hot desert in the world", "stance": "supports"}]},
+      "gold_status": "supported"
+    },
+    {
+      "id": "claim-sup-16",
+      "kind": "claim",
+      "claim": "The freezing point of water is 0 degrees Celsius at sea level.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Melting_point", "title": "Melting point", "snippet": "The melting (and freezing) point of water at standard pressure is 0 degrees Celsius.", "score": 0.92}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.95, "evidence": [{"source": "https://en.wikipedia.org/wiki/Melting_point", "quote": "freezing point of water at standard pressure is 0 degrees Celsius", "stance": "supports"}]},
+      "gold_status": "supported"
+    },
+    {
+      "id": "claim-sup-17",
+      "kind": "claim",
+      "claim": "Tokyo is the capital of Japan.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Tokyo", "title": "Tokyo", "snippet": "Tokyo, officially the Tokyo Metropolis, is the capital and most populous city of Japan.", "score": 0.96}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.97, "evidence": [{"source": "https://en.wikipedia.org/wiki/Tokyo", "quote": "the capital and most populous city of Japan", "stance": "supports"}]},
+      "gold_status": "supported"
+    },
+    {
+      "id": "claim-unsup-01",
+      "kind": "claim",
+      "claim": "The Great Wall of China is visible from the Moon with the naked eye.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Great_Wall_of_China", "title": "Great Wall of China", "snippet": "The claim that the Great Wall is visible from the Moon with the naked eye is a myth; it is not visible from low Earth orbit without aid.", "score": 0.9}
+      ],
+      "recorded_judgment": {"status": "unsupported", "confidence": 0.88, "evidence": [{"source": "https://en.wikipedia.org/wiki/Great_Wall_of_China", "quote": "visible from the Moon with the naked eye is a myth", "stance": "refutes"}]},
+      "gold_status": "unsupported"
+    },
+    {
+      "id": "claim-unsup-02",
+      "kind": "claim",
+      "claim": "Humans use only 10 percent of their brains.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Ten_percent_of_the_brain_myth", "title": "Ten percent of the brain myth", "snippet": "The ten percent of the brain myth is the false assertion that most humans only use 10 percent of their brains.", "score": 0.91}
+      ],
+      "recorded_judgment": {"status": "unsupported", "confidence": 0.9, "evidence": [{"source": "https://en.wikipedia.org/wiki/Ten_percent_of_the_brain_myth", "quote": "false assertion that most humans only use 10 percent of their brains", "stance": "refutes"}]},
+      "gold_status": "unsupported"
+    },
+    {
+      "id": "claim-unsup-03",
+      "kind": "claim",
+      "claim": "The Earth is the center of the solar system.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Heliocentrism", "title": "Heliocentrism", "snippet": "Heliocentrism is the astronomical model in which the Earth and planets revolve around the Sun at the center of the Solar System.", "score": 0.92}
+      ],
+      "recorded_judgment": {"status": "unsupported", "confidence": 0.93, "evidence": [{"source": "https://en.wikipedia.org/wiki/Heliocentrism", "quote": "the Earth and planets revolve around the Sun at the center of the Solar System", "stance": "refutes"}]},
+      "gold_status": "unsupported"
+    },
+    {
+      "id": "claim-unsup-04",
+      "kind": "claim",
+      "claim": "Goldfish have a memory span of only three seconds.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Goldfish", "title": "Goldfish", "snippet": "Studies have shown that goldfish have a memory span of at least three months, contradicting the popular three-second myth.", "score": 0.88}
+      ],
+      "recorded_judgment": {"status": "unsupported", "confidence": 0.86, "evidence": [{"source": "https://en.wikipedia.org/wiki/Goldfish", "quote": "a memory span of at least three months, contradicting the popular three-second myth", "stance": "refutes"}]},
+      "gold_status": "unsupported"
+    },
+    {
+      "id": "claim-unsup-05",
+      "kind": "claim",
+      "claim": "Lightning never strikes the same place twice.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Lightning", "title": "Lightning", "snippet": "Lightning can and often does strike the same place repeatedly; tall structures such as the Empire State Building are struck many times per year.", "score": 0.89}
+      ],
+      "recorded_judgment": {"status": "unsupported", "confidence": 0.87, "evidence": [{"source": "https://en.wikipedia.org/wiki/Lightning", "quote": "can and often does strike the same place repeatedly", "stance": "refutes"}]},
+      "gold_status": "unsupported"
+    },
+    {
+      "id": "claim-unsup-fp-01",
+      "kind": "claim",
+      "claim": "The Eiffel Tower was completed in 1889.",
+      "evidence": [
+        {"source": "https://en.wikipedia.org/wiki/Eiffel_Tower", "title": "Eiffel Tower", "snippet": "Constructed from 1887 to 1889 as the centerpiece of the 1889 World's Fair, the Eiffel Tower was the tallest man-made structure in the world.", "score": 0.9}
+      ],
+      "recorded_judgment": {"status": "unsupported", "confidence": 0.6, "evidence": [{"source": "https://en.wikipedia.org/wiki/Eiffel_Tower", "quote": "Constructed from 1887 to 1889", "stance": "refutes"}]},
+      "gold_status": "supported",
+      "note": "HONEST FALSE FLAG: the model mis-read 'Constructed from 1887 to 1889' and flagged the (true) 1889-completion claim unsupported. This is the one unsupported false positive that keeps unsupported-class precision below 1.0 (the meaningful-gate guard)."
+    },
+    {
+      "id": "claim-sup-overclaim-01",
+      "kind": "claim",
+      "claim": "Acme Corp's revenue grew 23 percent in Q3 2025.",
+      "evidence": [
+        {"source": "https://acme.example/press/q3-2025", "title": "Acme Q3 2025 press release", "snippet": "Acme Corp today announced revenue grew 23 percent year-over-year in the third quarter of 2025.", "score": 0.7}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.75, "evidence": [{"source": "https://acme.example/press/q3-2025", "quote": "revenue grew 23 percent year-over-year in the third quarter of 2025", "stance": "supports"}]},
+      "gold_status": "unverifiable",
+      "note": "Model asserted supported off a single self-published press release; gold is unverifiable (not independently corroborated). A recall miss on unverifiable, not a flagged-class error — does not affect the precision gate."
+    },
+    {
+      "id": "claim-thin-empty-01",
+      "kind": "claim",
+      "claim": "An unnamed startup raised five million dollars last week.",
+      "evidence": [],
+      "recorded_judgment": {"status": "supported", "confidence": 0.5, "evidence": [{"source": "https://news.example/unnamed-startup", "quote": "raised five million dollars", "stance": "supports"}]},
+      "gold_status": "unverifiable",
+      "thin_evidence": true,
+      "note": "Empty retrieved evidence: the model's cited source is not among the (zero) retrieved sources, so grounding drops it and the supported label downgrades to unverifiable."
+    },
+    {
+      "id": "claim-thin-ungrounded-01",
+      "kind": "claim",
+      "claim": "The new policy will reduce operating costs by 40 percent.",
+      "evidence": [
+        {"source": "https://gov.example/policy-brief", "title": "Policy brief", "snippet": "The brief outlines the policy goals but does not quantify the projected cost savings.", "score": 0.6}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.55, "evidence": [{"source": "https://blog.example/fabricated-analysis", "quote": "cuts operating costs by 40 percent", "stance": "supports"}]},
+      "gold_status": "unverifiable",
+      "thin_evidence": true,
+      "note": "Label-needs-evidence downgrade: the model cited a source NOT in the retrieved evidence (fabricated grounding), so it is dropped and supported downgrades to unverifiable."
+    },
+    {
+      "id": "claim-thin-blankstatus-01",
+      "kind": "claim",
+      "claim": "Some assert the board meeting happened on Tuesday.",
+      "evidence": [],
+      "recorded_judgment": {"status": "", "confidence": 0.4, "evidence": []},
+      "gold_status": "unverifiable",
+      "thin_evidence": true,
+      "note": "Blank status coerces to unverifiable."
+    },
+    {
+      "id": "claim-thin-unknownstatus-01",
+      "kind": "claim",
+      "claim": "The product may launch in 2026.",
+      "evidence": [],
+      "recorded_judgment": {"status": "maybe", "confidence": 0.4, "evidence": []},
+      "gold_status": "unverifiable",
+      "thin_evidence": true,
+      "note": "Unknown status 'maybe' coerces to unverifiable."
+    },
+    {
+      "id": "claim-thin-empty-unsup-01",
+      "kind": "claim",
+      "claim": "There is no record that the old bridge was built in 1850.",
+      "evidence": [],
+      "recorded_judgment": {"status": "unsupported", "confidence": 0.5, "evidence": [{"source": "https://archive.example/bridge", "quote": "no construction date is recorded", "stance": "refutes"}]},
+      "gold_status": "unverifiable",
+      "thin_evidence": true,
+      "note": "Empty evidence with an unsupported label and an ungrounded citation: grounding drops it and unsupported downgrades to unverifiable (precision over recall — no flag on nothing)."
+    },
+    {
+      "id": "claim-thin-noquote-01",
+      "kind": "claim",
+      "claim": "The author lives in Berlin.",
+      "evidence": [
+        {"source": "https://bio.example/author", "title": "Author bio", "snippet": "The author bio page is currently unavailable.", "score": 0.3}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.5, "evidence": []},
+      "gold_status": "unverifiable",
+      "thin_evidence": true,
+      "note": "Recorded judgment carried no evidence items, so a supported label has no grounding and downgrades to unverifiable."
+    },
+    {
+      "id": "claim-thin-blankquote-01",
+      "kind": "claim",
+      "claim": "The treaty was signed in a private session.",
+      "evidence": [
+        {"source": "https://history.example/treaty", "title": "Treaty history", "snippet": "Records of the signing session are incomplete.", "score": 0.4}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.5, "evidence": [{"source": "https://history.example/treaty", "quote": "", "stance": "supports"}]},
+      "gold_status": "unverifiable",
+      "thin_evidence": true,
+      "note": "The single cited evidence item has a blank quote, so it is dropped; the supported label then has no grounding and downgrades to unverifiable."
+    },
+    {
+      "id": "claim-thin-blanksource-01",
+      "kind": "claim",
+      "claim": "The committee approved the proposal unanimously.",
+      "evidence": [
+        {"source": "https://minutes.example/committee", "title": "Committee minutes", "snippet": "The minutes do not record the vote tally.", "score": 0.4}
+      ],
+      "recorded_judgment": {"status": "supported", "confidence": 0.5, "evidence": [{"source": "", "quote": "approved unanimously", "stance": "supports"}]},
+      "gold_status": "unverifiable",
+      "thin_evidence": true,
+      "note": "The cited evidence item has a blank source (not in the retrieved set), so it is dropped and the supported label downgrades to unverifiable."
+    },
+    {
+      "id": "claim-unv-01",
+      "kind": "claim",
+      "claim": "The corner cafe serves the best coffee in town.",
+      "evidence": [
+        {"source": "https://reviews.example/corner-cafe", "title": "Corner Cafe reviews", "snippet": "Reviews of the corner cafe are mixed, with praise for the pastries and criticism of the espresso.", "score": 0.6}
+      ],
+      "recorded_judgment": {"status": "unverifiable", "confidence": 0.3, "evidence": [{"source": "https://reviews.example/corner-cafe", "quote": "Reviews of the corner cafe are mixed", "stance": "neutral"}]},
+      "gold_status": "unverifiable",
+      "note": "Subjective superlative; the model correctly returns unverifiable even with evidence present (not thin)."
+    },
+    {
+      "id": "claim-unv-02",
+      "kind": "claim",
+      "claim": "The upcoming election results will be close.",
+      "evidence": [
+        {"source": "https://polls.example/race", "title": "Polling summary", "snippet": "Polls for the race show the candidates within the margin of error, but the outcome is not yet decided.", "score": 0.6}
+      ],
+      "recorded_judgment": {"status": "unverifiable", "confidence": 0.3, "evidence": [{"source": "https://polls.example/race", "quote": "the outcome is not yet decided", "stance": "neutral"}]},
+      "gold_status": "unverifiable",
+      "note": "A prediction about an undecided future event; correctly unverifiable (not thin)."
+    },
+    {
+      "id": "claim-unv-03",
+      "kind": "claim",
+      "claim": "The comet will be visible to the naked eye next month.",
+      "evidence": [
+        {"source": "https://astro.example/comet", "title": "Comet forecast", "snippet": "Whether the comet brightens enough to be seen without aid depends on outgassing that cannot yet be predicted.", "score": 0.6}
+      ],
+      "recorded_judgment": {"status": "unverifiable", "confidence": 0.3, "evidence": [{"source": "https://astro.example/comet", "quote": "depends on outgassing that cannot yet be predicted", "stance": "neutral"}]},
+      "gold_status": "unverifiable",
+      "note": "Uncertain future visibility; correctly unverifiable (not thin)."
+    },
+    {
+      "id": "cite-fab-404-01",
+      "kind": "citation",
+      "url": "https://journal.example/articles/nonexistent-page",
+      "recorded_fetch": {"http_status": 404},
+      "gold_flag": "fabricated",
+      "note": "Definitive 404 — the source does not exist. Correctly fabricated."
+    },
+    {
+      "id": "cite-fab-410-01",
+      "kind": "citation",
+      "url": "https://news.example/2019/deleted-article",
+      "recorded_fetch": {"http_status": 410},
+      "gold_flag": "fabricated",
+      "note": "Definitive 410 Gone. Correctly fabricated."
+    },
+    {
+      "id": "cite-fab-404-02",
+      "kind": "citation",
+      "url": "https://repository.example/papers/fake-study-2024",
+      "recorded_fetch": {"http_status": 404},
+      "gold_flag": "fabricated",
+      "note": "Definitive 404. Correctly fabricated."
+    },
+    {
+      "id": "cite-fab-410-02",
+      "kind": "citation",
+      "url": "https://blog.example/removed-post",
+      "recorded_fetch": {"http_status": 410},
+      "gold_flag": "fabricated",
+      "note": "Definitive 410 Gone. Correctly fabricated."
+    },
+    {
+      "id": "cite-amb-403-01",
+      "kind": "citation",
+      "url": "https://paywalled.example/research/full-text",
+      "recorded_fetch": {"http_status": 403},
+      "gold_flag": "ok",
+      "note": "403 Forbidden (paywalled / bot-blocked) — ambiguous, NOT absent. The OLD code mis-flagged this fabricated; the fix maps it to ok (cannot prove fabricated)."
+    },
+    {
+      "id": "cite-amb-429-01",
+      "kind": "citation",
+      "url": "https://api.example/source/rate-limited",
+      "recorded_fetch": {"http_status": 429},
+      "gold_flag": "ok",
+      "note": "429 Too Many Requests — transient. Ambiguous -> ok. Old false fabricated removed."
+    },
+    {
+      "id": "cite-amb-503-01",
+      "kind": "citation",
+      "url": "https://docs.example/maintenance",
+      "recorded_fetch": {"http_status": 503},
+      "gold_flag": "ok",
+      "note": "503 Service Unavailable — momentarily down. Ambiguous -> ok. Old false fabricated removed."
+    },
+    {
+      "id": "cite-amb-500-01",
+      "kind": "citation",
+      "url": "https://portal.example/record/9921",
+      "recorded_fetch": {"http_status": 500},
+      "gold_flag": "ok",
+      "note": "500 Internal Server Error — server fault, not proof of absence. Ambiguous -> ok."
+    },
+    {
+      "id": "cite-amb-timeout-01",
+      "kind": "citation",
+      "url": "https://slow.example/large-report.pdf",
+      "recorded_fetch": {"transport_error": "timeout"},
+      "gold_flag": "ok",
+      "note": "Transport timeout — flaky, not proof of absence. Ambiguous -> ok. Old false fabricated removed."
+    },
+    {
+      "id": "cite-ok-200-01",
+      "kind": "citation",
+      "url": "https://en.wikipedia.org/wiki/Photosynthesis",
+      "recorded_fetch": {"http_status": 200},
+      "recorded_support_status": "supported",
+      "gold_flag": "ok",
+      "note": "Retrievable and supports the attached output. ok."
+    },
+    {
+      "id": "cite-ok-200-02",
+      "kind": "citation",
+      "url": "https://en.wikipedia.org/wiki/Mount_Everest",
+      "recorded_fetch": {"http_status": 200},
+      "recorded_support_status": "supported",
+      "gold_flag": "ok",
+      "note": "Retrievable and supports. ok."
+    },
+    {
+      "id": "cite-ok-200-03",
+      "kind": "citation",
+      "url": "https://en.wikipedia.org/wiki/Pacific_Ocean",
+      "recorded_fetch": {"http_status": 200},
+      "recorded_support_status": "supported",
+      "gold_flag": "ok",
+      "note": "Retrievable and supports. ok."
+    },
+    {
+      "id": "cite-misatt-200-01",
+      "kind": "citation",
+      "url": "https://en.wikipedia.org/wiki/Cooking",
+      "recorded_fetch": {"http_status": 200},
+      "recorded_support_status": "unsupported",
+      "gold_flag": "misattributed",
+      "note": "Retrievable but the source positively does NOT back the attached output. misattributed."
+    },
+    {
+      "id": "cite-misatt-200-02",
+      "kind": "citation",
+      "url": "https://en.wikipedia.org/wiki/Weather",
+      "recorded_fetch": {"http_status": 200},
+      "recorded_support_status": "unsupported",
+      "gold_flag": "misattributed",
+      "note": "Retrievable but positively refutes the attached output. misattributed."
+    },
+    {
+      "id": "cite-ok-200-unv-01",
+      "kind": "citation",
+      "url": "https://en.wikipedia.org/wiki/Coffee",
+      "recorded_fetch": {"http_status": 200},
+      "recorded_support_status": "unverifiable",
+      "gold_flag": "ok",
+      "note": "Retrievable; support is unconfirmed (judge unverifiable). We do not cry wolf -> ok with support unconfirmed."
+    }
+  ]
+}

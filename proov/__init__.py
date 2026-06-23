@@ -13,8 +13,12 @@ retrieval, multi-pass (self-consistency) judgment and provided+discovered citati
 wider SLA budget, and the provider uploads a downloadable full report for large deliverables.
 As of Story 2.8 the claim→evidence cache `[E]` (`cache`) lands — a TTL'd SQLite cache wired
 into `retrieve_evidence` so a repeated claim is served with no new search call (the order/metrics
-ledger `[E]` arrives in Story 3.2). Only `[A]` is CROO-coupled — `[B]`/`[C]`/`[D]`/`[E]` stay
-pure, SDK-agnostic Python.
+ledger `[E]` arrives in Story 3.2). As of Story 3.1 the engine is calibrated to the ≥80%-precision
+bar (NFR4): `calibration` is a pure, deterministic scorer measuring verdict precision against a
+committed hand-labeled set (`calibration/calibration_set.json`), gated offline by the suite and
+the `scripts/calibrate.py` runner; the `fabricated` citation flag is tightened to a definitive
+404/410 (precision over recall). Only `[A]` is CROO-coupled — `[B]`/`[C]`/`[D]`/`[E]` stay pure,
+SDK-agnostic Python.
 """
 
 # Single source of the Proov version, stamped into every on-chain receipt (Story 1.4).

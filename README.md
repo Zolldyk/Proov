@@ -23,7 +23,11 @@ the SAME pipeline keyed on `tier == "deep"` — multi-source evidence merge, mul
 large reports, also delivers a downloadable full copy via `upload_file` + `get_download_url`
 linked from a `report_file` sibling, alongside the same independently verifiable receipt. As of
 Story 2.8 a repeated claim is served from a TTL'd SQLite **claim→evidence cache** with no new
-search-provider call — the cost/latency enabler of the $0-marginal model at volume.
+search-provider call — the cost/latency enabler of the $0-marginal model at volume. As of Story 3.1
+the engine is **calibrated to the ≥80%-precision bar** (NFR4, precision over recall): verdict
+precision is measured against a committed ~50-row hand-labeled set and gated offline, and the
+`fabricated` citation flag is tightened to fire only on a definitive 404/410 — no more false alarms
+on paywalled / rate-limited / transiently-down sources.
 
 ## How it works
 
@@ -212,15 +216,18 @@ from their already-assigned stance, at zero extra fetch/judge cost.
   per-claim judgment (via `judge_claim`) — **no new LLM config, no new LLM interface**. The
   output is the source's synthetic "attached claim".
 - **Flags.** `ok` (retrievable and supports the output, or support merely unconfirmed),
-  `fabricated` (NOT retrievable), `misattributed` (retrievable but positively refuted).
-- **Precision over recall (never cry wolf).** `fabricated` fires **only** on a confirmed
-  unretrievable source (it is the verdict-flipping flag the Story 2.5 `fail` rule keys on),
-  and `misattributed` **only** on a positive `unsupported` judgment — mere uncertainty
-  (`unverifiable`, or content we couldn't read) is `ok` with support left unconfirmed. The
-  check **never crashes a paid order**: a bad source degrades to a conservative non-fabricated
-  `ok`, not a false `fabricated`.
-- **Config.** One new optional env var, `PROOV_CITATION_TIMEOUT` (seconds, default 10), bounds
-  the per-source fetch; support reuses the existing LLM env. No new dependency.
+  `fabricated` (a **definitive** 404/410 — the source provably does not exist),
+  `misattributed` (retrievable but positively refuted).
+- **Precision over recall (never cry wolf).** `fabricated` fires **only** on a confirmed-absent
+  source — a definitive 404/410 (it is the verdict-flipping flag the Story 2.5 `fail` rule keys
+  on); a restricted / transient response (401/403/429/5xx, a timeout or DNS failure) is
+  **ambiguous → `ok`**, never a false `fabricated` (the Story 3.1 precision fix). `misattributed`
+  fires **only** on a positive `unsupported` judgment — mere uncertainty (`unverifiable`, or
+  content we couldn't read) is `ok` with support left unconfirmed. The check **never crashes a
+  paid order**: a bad source degrades to a conservative non-fabricated `ok`.
+- **Config.** `PROOV_CITATION_TIMEOUT` (seconds, default 10) bounds the per-source fetch;
+  `PROOV_CITATION_USER_AGENT` (Story 3.1) overrides the browser-like fetch User-Agent; support
+  reuses the existing LLM env. No new dependency.
 
 ### Deterministic verdict (Story 2.5)
 
@@ -345,6 +352,39 @@ PROOV_CACHE_TTL_SECONDS=86400    # entry lifetime in seconds (24 h); garbage fal
 The test suite runs with caching **disabled** (an autouse fixture sets `PROOV_CACHE_ENABLED=0`), so
 no `proov_cache.db` is written and existing behaviour is unchanged. No new dependency (`sqlite3` is
 stdlib). The order/metrics ledger that will share this `[E]` slot is Story 3.2.
+
+### Calibration to the precision bar (Story 3.1)
+
+Proov's promise is a **trustworthy** verifier: *"a verifier that cries wolf is worse than useless"*
+(PRD §1 / NFR4). Story 3.1 makes that measurable, reproducible, and gated — and tightens the one
+precision leak the earlier reviews deferred here.
+
+- **The ≥80% precision bar, precision over recall.** `proov/calibration.py` is a **pure**,
+  deterministic scorer (built in the style of `proov/verdict.py` — no `croo`, no `httpx`, no I/O in
+  the scoring math). It computes a per-class confusion matrix + precision/recall and the **pooled
+  precision** over the two verdict-flipping flags (`unsupported` claims, `fabricated` citations).
+  The gate (`meets_bar`) keys on **precision only** — recall is reported but never gated: it is
+  acceptable to miss a real bad claim, never acceptable to falsely flag a good one. A flag class
+  with zero predictions has *undefined* precision (excluded from the gate, never scored `0.0`).
+- **A committed hand-labeled set.** `calibration/calibration_set.json` is a ~50-row hand-labeled
+  product artifact (≈35 claim rows + ≈15 citation rows) covering the flagged classes and the
+  thin-evidence guard. It is **deliberately honest** — it seeds a few real model errors so measured
+  precision is below 100% but ≥80%, proving the bar is a genuine threshold, not a tautology.
+- **404/410-only `fabricated` (the precision fix).** `proov/citations.py` now classifies
+  retrievability three ways: `retrievable` (status < 400), `absent` (a definitive 404/410 → the
+  only path to `fabricated`), or `ambiguous` (any other 4xx/5xx, a timeout or DNS failure → the
+  conservative `ok`). A paywalled 403, a rate-limited 429, a momentary 503 or a flaky timeout no
+  longer produces a false `fail`. Fetches now send a browser-like `User-Agent`
+  (`PROOV_CITATION_USER_AGENT` to override).
+- **Run it.** `python scripts/calibrate.py` runs the **offline replay**: it feeds the frozen
+  recorded model outputs / fetch results through the *real* deterministic pipeline (the grounding
+  guards, the new classifier), prints the per-class report and an explicit PASS/FAIL against the
+  0.80 bar, and exits non-zero on FAIL — **no network, no spend**, the same path the test suite
+  gates on. `python scripts/calibrate.py --live` instead calls real Gemini/Tavily over the dataset
+  to **refresh** the frozen snapshot (real spend, requires keys — the operator's empirical run).
+- **Gated in the suite ($0, offline).** `tests/test_calibration.py` asserts the pooled, `unsupported`
+  and `fabricated` precisions all clear 0.80, that every thin-evidence row resolves to
+  `unverifiable` (100%), and that at least one flag class is below 1.0 (so the gate is meaningful).
 
 ## Input/output contract
 

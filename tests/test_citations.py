@@ -17,9 +17,12 @@ import pytest
 from proov.citations import (
     _MAX_FETCH_CHARS,
     _DEFAULT_CITATION_TIMEOUT,
+    _DEFAULT_USER_AGENT,
+    _classify_retrievability,
     _fetch_source,
     _flag_for,
     _resolve_timeout,
+    _resolve_user_agent,
     _strip_html,
     check_citations,
 )
@@ -31,6 +34,7 @@ from proov.types import CitationCheck, Claim, Evidence, Judgment
 def _clear_citation_env(monkeypatch):
     """Citation env must not leak between tests (the entrypoint reads it directly)."""
     monkeypatch.delenv("PROOV_CITATION_TIMEOUT", raising=False)
+    monkeypatch.delenv("PROOV_CITATION_USER_AGENT", raising=False)
     monkeypatch.delenv("PROOV_LLM_PROVIDER", raising=False)
 
 
@@ -106,18 +110,42 @@ def test_strip_html_removes_tags_and_collapses_whitespace():
     assert _strip_html("<p>Hello   <b>world</b></p>\n\n  done") == "Hello world done"
 
 
+# ----------------------------------------------- _classify_retrievability (Story 3.1 precision fix)
+
+
+def test_classify_retrievability_three_way():
+    # status < 400 -> retrievable.
+    assert _classify_retrievability(200, transport_error=False) == "retrievable"
+    assert _classify_retrievability(204, transport_error=False) == "retrievable"
+    # DEFINITIVE 404/410 -> absent (the only path to `fabricated`).
+    assert _classify_retrievability(404, transport_error=False) == "absent"
+    assert _classify_retrievability(410, transport_error=False) == "absent"
+    # Any other 4xx/5xx (restricted / transient) -> ambiguous, NOT fabricated.
+    for status in (401, 403, 429, 500, 503):
+        assert _classify_retrievability(status, transport_error=False) == "ambiguous"
+    # Transport error / missing status -> ambiguous (we reached no verdict on existence).
+    assert _classify_retrievability(None, transport_error=True) == "ambiguous"
+    assert _classify_retrievability(None, transport_error=False) == "ambiguous"
+
+
+def test_resolve_user_agent_default_and_override():
+    assert _resolve_user_agent(None) == _DEFAULT_USER_AGENT
+    assert _resolve_user_agent("   ") == _DEFAULT_USER_AGENT
+    assert _resolve_user_agent("MyBot/1.0") == "MyBot/1.0"
+
+
 # --------------------------------------------------------------------------- _fetch_source
 
 
-async def test_fetch_source_200_returns_stripped_bounded_text():
+async def test_fetch_source_200_returns_retrievable_stripped_bounded_text():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text=_html("Paris is the capital of France."))
 
     async with _mock_fetch_client(handler) as client:
-        retrievable, text = await _fetch_source(
+        cls, text = await _fetch_source(
             "https://example.com", client=client, timeout=1.0
         )
-    assert retrievable is True
+    assert cls == "retrievable"
     assert text == "Paris is the capital of France."
     assert "<" not in text  # tags stripped
 
@@ -129,24 +157,37 @@ async def test_fetch_source_bounds_to_max_fetch_chars():
         return httpx.Response(200, text=long_body)
 
     async with _mock_fetch_client(handler) as client:
-        retrievable, text = await _fetch_source(
+        cls, text = await _fetch_source(
             "https://example.com", client=client, timeout=1.0
         )
-    assert retrievable is True
+    assert cls == "retrievable"
     assert len(text) == _MAX_FETCH_CHARS
 
 
-@pytest.mark.parametrize("status", [404, 410, 500, 503])
-async def test_fetch_source_4xx_5xx_is_not_retrievable(status):
+@pytest.mark.parametrize("status", [404, 410])
+async def test_fetch_source_404_410_is_absent(status):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(status, text="nope")
 
     async with _mock_fetch_client(handler) as client:
         result = await _fetch_source("https://example.com", client=client, timeout=1.0)
-    assert result == (False, "")
+    assert result == ("absent", "")  # definitive not-found -> the only fabricated path
 
 
-async def test_fetch_source_swallows_transport_errors():
+@pytest.mark.parametrize("status", [401, 403, 429, 500, 503])
+async def test_fetch_source_other_4xx_5xx_is_ambiguous(status):
+    # The precision fix: restricted / transient statuses are NO LONGER treated as fabricated.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, text="nope")
+
+    async with _mock_fetch_client(handler) as client:
+        result = await _fetch_source("https://example.com", client=client, timeout=1.0)
+    assert result == ("ambiguous", "")
+
+
+async def test_fetch_source_transport_errors_are_ambiguous():
+    # A transport failure can NOT prove a source fabricated -> ambiguous (was previously dropped
+    # into the fabricated path via `(False, "")`).
     def connect_handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("dns boom", request=request)
 
@@ -154,9 +195,9 @@ async def test_fetch_source_swallows_transport_errors():
         raise httpx.TimeoutException("slow", request=request)
 
     async with _mock_fetch_client(connect_handler) as client:
-        assert await _fetch_source("https://a", client=client, timeout=1.0) == (False, "")
+        assert await _fetch_source("https://a", client=client, timeout=1.0) == ("ambiguous", "")
     async with _mock_fetch_client(timeout_handler) as client:
-        assert await _fetch_source("https://b", client=client, timeout=1.0) == (False, "")
+        assert await _fetch_source("https://b", client=client, timeout=1.0) == ("ambiguous", "")
 
 
 async def test_fetch_source_follows_redirects():
@@ -166,23 +207,51 @@ async def test_fetch_source_follows_redirects():
         return httpx.Response(200, text=_html("final page"))
 
     async with _mock_fetch_client(handler) as client:
-        retrievable, text = await _fetch_source(
+        cls, text = await _fetch_source(
             "https://example.com/old", client=client, timeout=1.0
         )
-    assert retrievable is True
+    assert cls == "retrievable"
     assert text == "final page"
 
 
-# --------------------------------------------------------------------------- _flag_for (all five AC5 rows)
+async def test_fetch_source_sends_browser_user_agent():
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["ua"] = request.headers.get("user-agent", "")
+        return httpx.Response(200, text=_html("page"))
+
+    async with _mock_fetch_client(handler) as client:
+        await _fetch_source("https://example.com", client=client, timeout=1.0)
+    assert seen["ua"] == _DEFAULT_USER_AGENT
+
+
+async def test_fetch_source_honours_user_agent_override(monkeypatch):
+    monkeypatch.setenv("PROOV_CITATION_USER_AGENT", "ProovBot/9.9")
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["ua"] = request.headers.get("user-agent", "")
+        return httpx.Response(200, text=_html("page"))
+
+    async with _mock_fetch_client(handler) as client:
+        await _fetch_source("https://example.com", client=client, timeout=1.0)
+    assert seen["ua"] == "ProovBot/9.9"
+
+
+# ------------------------------------------- _flag_for: three-way classification -> (retr, supports, flag)
 
 
 def test_flag_for_all_rows():
-    assert _flag_for(False, None) == (False, "fabricated")
-    assert _flag_for(False, "supported") == (False, "fabricated")  # never judged when unret.
-    assert _flag_for(True, "supported") == (True, "ok")
-    assert _flag_for(True, "unsupported") == (False, "misattributed")
-    assert _flag_for(True, "unverifiable") == (False, "ok")
-    assert _flag_for(True, None) == (False, "ok")
+    # absent (404/410) -> the only fabricated path.
+    assert _flag_for("absent", None) == (False, False, "fabricated")
+    # ambiguous (other 4xx/5xx / timeout) -> ok, NOT fabricated (the precision fix).
+    assert _flag_for("ambiguous", None) == (False, False, "ok")
+    # retrievable -> judge the fetched content for support.
+    assert _flag_for("retrievable", "supported") == (True, True, "ok")
+    assert _flag_for("retrievable", "unsupported") == (True, False, "misattributed")
+    assert _flag_for("retrievable", "unverifiable") == (True, False, "ok")
+    assert _flag_for("retrievable", None) == (True, False, "ok")
 
 
 # --------------------------------------------------------------------------- check_citations end-to-end
@@ -219,6 +288,46 @@ async def test_fabricated_source_short_circuits_without_judge():
         )
     assert result == [CitationCheck("https://gone.example", False, False, "fabricated")]
     assert spy.calls == []  # no support judgment attempted for a non-retrievable source
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 500, 503])
+async def test_ambiguous_source_is_ok_not_fabricated_without_judge(status):
+    # The precision fix end-to-end: a restricted / transient source is NOT a false `fabricated`
+    # (which would flip the verdict to `fail`). It degrades to a conservative non-crying-wolf
+    # `ok` with support unconfirmed, and no support judgment is spent.
+    spy = _CitationJudgeSpy()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, text="blocked")
+
+    async with _mock_fetch_client(handler) as client:
+        result = await check_citations(
+            "the output",
+            [{"url": "https://restricted.example"}],
+            "quick",
+            provider=spy,
+            client=client,
+        )
+    assert result == [CitationCheck("https://restricted.example", False, False, "ok")]
+    assert spy.calls == []  # ambiguous -> no judge spend
+
+
+async def test_timeout_source_is_ok_not_fabricated():
+    spy = _CitationJudgeSpy()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.TimeoutException("slow", request=request)
+
+    async with _mock_fetch_client(handler) as client:
+        result = await check_citations(
+            "the output",
+            [{"url": "https://slow.example"}],
+            "quick",
+            provider=spy,
+            client=client,
+        )
+    assert result == [CitationCheck("https://slow.example", False, False, "ok")]
+    assert spy.calls == []
 
 
 async def test_retrievable_supported_source_is_ok():

@@ -5,9 +5,12 @@ with their output, this module checks each one on two axes and flags it
 `ok`/`fabricated`/`misattributed` for the PRD §6 `citations_checked[]` field:
 
   1. **Retrievability** — a small, injectable `httpx` GET of the source URL (status < 400,
-     redirects followed). A confirmed non-retrievable source is `fabricated` — the only
+     redirects followed, browser-like `User-Agent`). Classified **three ways** (Story 3.1):
+     `retrievable`, `absent` (a DEFINITIVE 404/410), or `ambiguous` (any other 4xx/5xx or a
+     transport error). Only a confirmed-`absent` source is `fabricated` — the only
      verdict-flipping citation flag (FR10 `fail = ≥1 fabricated citation`, applied by the
-     Story 2.5 aggregator, not here).
+     Story 2.5 aggregator, not here); an `ambiguous` source (paywalled / rate-limited /
+     momentarily down) is the conservative `ok`, never a false `fabricated` (NFR4).
   2. **Support** — whether the retrieved source actually backs the output. This **reuses the
      existing `proov.llm.judge_claim` seam** (Story 2.3) — NO new `LLMProvider` method, NO
      change to `proov/llm.py`; citation support is the *third* consumer of that interface
@@ -33,6 +36,7 @@ import logging
 import math
 import os
 import re
+from typing import Literal
 
 import httpx
 
@@ -47,6 +51,24 @@ _MAX_FETCH_CHARS = 2000
 _MAX_CLAIM_CHARS = 2000
 # Per-source fetch timeout default; an infinite timeout would defeat the SLA (NFR2).
 _DEFAULT_CITATION_TIMEOUT = 10.0
+
+# Three-way retrievability classification (Story 3.1 precision fix). `retrievable` (the source
+# resolved, status < 400), `absent` (a DEFINITIVE 404/410 — the source provably does not
+# exist), or `ambiguous` (any other 4xx/5xx — 401/403/429/5xx — or a transport error / timeout
+# / DNS failure: we cannot *prove* the source fabricated, so we must not cry wolf).
+Retrievability = Literal["retrievable", "absent", "ambiguous"]
+
+# Only a confirmed 404/410 maps to the verdict-flipping `fabricated` flag (NFR4 precision over
+# recall). A paywalled 403, rate-limited 429, momentary 503, or flaky timeout is `ambiguous` →
+# the conservative `ok`, never a false `fail` (the deferred-work 2.4 OQ1 item, fixed here).
+_DEFINITIVE_ABSENT: frozenset[int] = frozenset({404, 410})
+
+# A browser-like default User-Agent so a bot-blocking 403 is avoided where possible (override
+# via `PROOV_CITATION_USER_AGENT`). These are arbitrary buyer URLs — still no API key/auth.
+_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 # Strip HTML tags and collapse whitespace so a fetched page becomes lean text for the judge.
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
@@ -71,6 +93,39 @@ def _resolve_timeout(raw: str | None) -> float:
     return value
 
 
+def _resolve_user_agent(raw: str | None = None) -> str:
+    """Resolve the citation-fetch `User-Agent`: `PROOV_CITATION_USER_AGENT` or the browser default.
+
+    A blank / unset value falls back to `_DEFAULT_USER_AGENT` (a real desktop UA string) so a
+    bot-blocking 403 is avoided where possible — under the new classification a 403 is only
+    `ambiguous` (→ `ok`) anyway, but a successful fetch lets us actually judge support.
+    """
+    candidate = raw if raw is not None else os.environ.get("PROOV_CITATION_USER_AGENT")
+    if isinstance(candidate, str) and candidate.strip():
+        return candidate
+    return _DEFAULT_USER_AGENT
+
+
+def _classify_retrievability(
+    status_code: int | None, *, transport_error: bool
+) -> Retrievability:
+    """Map an HTTP status / transport outcome to the three-way `Retrievability` (PURE).
+
+    The precision lever (NFR4). A transport error / timeout / DNS failure (or an absent status)
+    is `ambiguous` — we reached no verdict on existence; a DEFINITIVE 404/410 is `absent` (the
+    source provably does not exist → the only path to `fabricated`); `status < 400` is
+    `retrievable`; every other 4xx/5xx (401/403/429/5xx) is `ambiguous` — restricted or
+    transiently unavailable, NOT proof of fabrication. No I/O, no env — same inputs ⇒ same class.
+    """
+    if transport_error or status_code is None:
+        return "ambiguous"
+    if status_code in _DEFINITIVE_ABSENT:
+        return "absent"
+    if status_code < 400:
+        return "retrievable"
+    return "ambiguous"
+
+
 def _strip_html(text: str) -> str:
     """Strip HTML tags and collapse whitespace to clean text.
 
@@ -88,70 +143,85 @@ async def _fetch_source(
     *,
     client: httpx.AsyncClient | None = None,
     timeout: float,
-) -> tuple[bool, str]:
-    """Retrievability probe: one async GET, NEVER raises out → `(retrievable, cleaned_text)`.
+) -> tuple[Retrievability, str]:
+    """Retrievability probe: one async GET, NEVER raises out → `(Retrievability, cleaned_text)`.
 
-    Issues a single async `httpx` GET with `follow_redirects=True`. A response with
-    `status_code < 400` (2xx / resolved-3xx) → `(True, cleaned)` where
-    `cleaned = _strip_html(response.text)[:_MAX_FETCH_CHARS]`; `status_code >= 400`
-    (4xx/5xx) → `(False, "")`; an `httpx.HTTPError` (transport / DNS / timeout) → `(False, "")`
-    with a logged warning. We do NOT call `raise_for_status()` — we must *distinguish*
-    retrievable from not, not raise on a 404.
+    Issues a single async `httpx` GET with `follow_redirects=True` and a browser-like
+    `User-Agent` (Story 3.1). The response status / transport outcome is classified three ways
+    via `_classify_retrievability`: a `retrievable` (status < 400) response →
+    `("retrievable", _strip_html(text)[:_MAX_FETCH_CHARS])`; an `absent` (404/410) or any
+    `ambiguous` (other 4xx/5xx) response → `(cls, "")`; an `httpx.HTTPError` (transport / DNS /
+    timeout) → `("ambiguous", "")` with a logged warning — a transport failure can NOT prove a
+    source fabricated. We do NOT call `raise_for_status()` — we must *distinguish* the classes,
+    not raise on a 404.
 
     The `httpx.AsyncClient` is injectable so tests drive it via `httpx.MockTransport` with no
-    real socket; when `None`, a client is opened with the resolved per-fetch timeout. These
-    are arbitrary buyer URLs — no API key, no auth header, and the response body is NEVER
-    logged (could be large/sensitive — log the exception repr / URL only; NFR5).
+    real socket; when `None`, a client is opened with the resolved per-fetch timeout. The UA
+    header is set per-request so it rides BOTH the owned and the injected client. These are
+    arbitrary buyer URLs — no API key, no auth header, and the response body is NEVER logged
+    (could be large/sensitive — log the exception repr / URL only; NFR5).
     """
+    headers = {"User-Agent": _resolve_user_agent()}
     try:
         if client is None:
             async with httpx.AsyncClient(
                 timeout=timeout, follow_redirects=True
             ) as owned:
-                response = await owned.get(url)
+                response = await owned.get(url, headers=headers)
         else:
             # The injected client (test MockTransport) carries its own behaviour; still ask
             # for redirect-following so a 3xx chain resolves like the owned-client path.
-            response = await client.get(url, follow_redirects=True)
+            response = await client.get(url, follow_redirects=True, headers=headers)
     except httpx.HTTPError as exc:
-        # Transport / DNS / timeout — a not-retrievable signal, not an exception out.
+        # Transport / DNS / timeout — ambiguous (we reached no verdict on existence), not an
+        # exception out, and NOT proof of fabrication.
         logger.warning("citation fetch failed for %s: %r", url, exc)
-        return (False, "")
+        return ("ambiguous", "")
 
-    if response.status_code >= 400:
-        logger.debug(
-            "citation source %s not retrievable (status %s)", url, response.status_code
-        )
-        return (False, "")
-    return (True, _strip_html(response.text)[:_MAX_FETCH_CHARS])
+    cls = _classify_retrievability(response.status_code, transport_error=False)
+    if cls == "retrievable":
+        return (cls, _strip_html(response.text)[:_MAX_FETCH_CHARS])
+    logger.debug(
+        "citation source %s classified %s (status %s)", url, cls, response.status_code
+    )
+    return (cls, "")
 
 
-def _flag_for(retrievable: bool, status: str | None) -> tuple[bool, CitationFlag]:
-    """Map a per-source `(retrievable, judge-status)` to `(supports_attached_claim, flag)`.
+def _flag_for(cls: Retrievability, status: str | None) -> tuple[bool, bool, CitationFlag]:
+    """Map a per-source `(Retrievability, judge-status)` → `(retrievable, supports, flag)`.
 
-    The precision-over-recall heart of this story (NFR4 / PRD §1). `supports_attached_claim`
-    is honest — it asserts support ONLY when the judge positively confirms it; `misattributed`
-    fires ONLY on a positive contradiction, never on uncertainty:
+    The precision-over-recall heart of this story (NFR4 / PRD §1) and the SINGLE classification
+    → flag mapping (shared by `check_citations` and the calibration replay). `supports` is
+    honest — asserted ONLY when the judge positively confirms it; `fabricated` fires ONLY on a
+    confirmed-`absent` source, `misattributed` ONLY on a positive contradiction — never on mere
+    uncertainty:
 
-      - not retrievable                → `(False, "fabricated")`  (verdict-flipping; FR10)
-      - retrievable, `supported`       → `(True,  "ok")`
-      - retrievable, `unsupported`     → `(False, "misattributed")`  (positively refuted)
-      - retrievable, `unverifiable` / `None` / blank-content sentinel
-                                       → `(False, "ok")`  (support UNCONFIRMED but we won't
-        cry wolf on thin evidence — the one intentional `ok` + `supports=False` row; correct,
-        not a bug — Open Question 3)
+      - `absent`      (404/410)              → `(False, False, "fabricated")`  (verdict-flipping; FR10)
+      - `ambiguous`   (other 4xx/5xx/timeout) → `(False, False, "ok")`  (cannot prove fabricated —
+        paywalled / rate-limited / transiently down; conservative, NEVER `misattributed`)
+      - `retrievable`, `supported`           → `(True,  True,  "ok")`
+      - `retrievable`, `unsupported`         → `(True,  False, "misattributed")`  (positively refuted)
+      - `retrievable`, `unverifiable` / `None` / blank-content sentinel
+                                             → `(True,  False, "ok")`  (support UNCONFIRMED but we
+        won't cry wolf on thin evidence — the intentional `ok` + `supports=False` row)
 
-    `status=None` is the caller's "no judgment was made" sentinel (blank fetched content, or
-    the judge degraded) — it lands in the final uncertainty branch.
+    `status=None` on the `retrievable` path is the caller's "no judgment was made" sentinel
+    (blank fetched content, or the judge degraded) — it lands in the final uncertainty branch.
+    The first tuple element (`retrievable`) is exactly `cls == "retrievable"`, the value the
+    `CitationCheck.retrievable` field carries.
     """
-    if not retrievable:
-        return (False, "fabricated")
+    if cls == "absent":
+        return (False, False, "fabricated")
+    if cls == "ambiguous":
+        # Cannot prove fabricated — support unconfirmed, but NOT a verdict-flipping flag.
+        return (False, False, "ok")
+    # retrievable → judge the fetched content for support.
     if status == "supported":
-        return (True, "ok")
+        return (True, True, "ok")
     if status == "unsupported":
-        return (False, "misattributed")
+        return (True, False, "misattributed")
     # "unverifiable" / None / blank-content → honest: support unconfirmed, but NOT misattributed.
-    return (False, "ok")
+    return (True, False, "ok")
 
 
 async def check_citations(
@@ -226,16 +296,10 @@ async def check_citations(
 
             for url, title in normalised:
                 try:
-                    retrievable, content = await _fetch_source(
+                    cls, content = await _fetch_source(
                         url, client=client, timeout=per_call
                     )
-                    if not retrievable:
-                        # Not retrievable → fabricated. No support judgment (no spend).
-                        supports, flag = _flag_for(False, None)
-                    elif not content.strip():
-                        # Retrievable but unreadable (JS-rendered / empty body) → ok, no judge.
-                        supports, flag = _flag_for(True, None)
-                    else:
+                    if cls == "retrievable" and content.strip():
                         judgment = await judge_claim(
                             Claim(id="citation-target", text=output[:_MAX_CLAIM_CHARS]),
                             [Evidence(source=url, title=title, snippet=content)],
@@ -243,7 +307,11 @@ async def check_citations(
                             provider=provider,
                             options=options,
                         )
-                        supports, flag = _flag_for(True, judgment.status)
+                        status = judgment.status
+                    else:
+                        # absent → fabricated; ambiguous → ok; retrievable+blank → ok. No spend.
+                        status = None
+                    retrievable, supports, flag = _flag_for(cls, status)
                 except Exception as exc:  # noqa: BLE001
                     # Both helpers already never raise, but a pluggable provider could raise
                     # anything; the "never raises out" contract requires we degrade THIS
