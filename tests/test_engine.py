@@ -233,11 +233,104 @@ async def test_explicit_claims_bypass_is_threaded(monkeypatch):
     assert captured["explicit_claims"] == ["The sky is blue."]
 
 
-def test_resolve_sla_seconds_hardening(monkeypatch):
-    # Mirror the other timeout-var hardening: default 240; garbage / non-finite / ≤0 → 240.
-    assert engine_mod._resolve_sla_seconds(None) == 240.0
-    assert engine_mod._resolve_sla_seconds("120") == 120.0
-    assert engine_mod._resolve_sla_seconds("nonsense") == 240.0
-    assert engine_mod._resolve_sla_seconds("0") == 240.0
-    assert engine_mod._resolve_sla_seconds("-5") == 240.0
-    assert engine_mod._resolve_sla_seconds("inf") == 240.0
+def test_resolve_sla_seconds_quick_hardening():
+    # Quick tier: default 240; garbage / non-finite / ≤0 → 240; a valid value is honoured.
+    assert engine_mod._resolve_sla_seconds("quick", None) == 240.0
+    assert engine_mod._resolve_sla_seconds("quick", "120") == 120.0
+    assert engine_mod._resolve_sla_seconds("quick", "nonsense") == 240.0
+    assert engine_mod._resolve_sla_seconds("quick", "0") == 240.0
+    assert engine_mod._resolve_sla_seconds("quick", "-5") == 240.0
+    assert engine_mod._resolve_sla_seconds("quick", "inf") == 240.0
+
+
+def test_resolve_sla_seconds_deep_hardening():
+    # Deep tier: default 1680 (28 min); same garbage/non-finite/≤0 hardening as Quick.
+    assert engine_mod._resolve_sla_seconds("deep", None) == 1680.0
+    assert engine_mod._resolve_sla_seconds("deep", "900") == 900.0
+    assert engine_mod._resolve_sla_seconds("deep", "nonsense") == 1680.0
+    assert engine_mod._resolve_sla_seconds("deep", "0") == 1680.0
+    assert engine_mod._resolve_sla_seconds("deep", "-5") == 1680.0
+    assert engine_mod._resolve_sla_seconds("deep", "nan") == 1680.0
+
+
+def test_resolve_sla_seconds_reads_tier_specific_env(monkeypatch):
+    # Each tier reads its OWN env var; the other tier's var does not bleed across.
+    monkeypatch.setenv("PROOV_QUICK_SLA_SECONDS", "111")
+    monkeypatch.setenv("PROOV_DEEP_SLA_SECONDS", "2222")
+    assert engine_mod._resolve_sla_seconds("quick") == 111.0
+    assert engine_mod._resolve_sla_seconds("deep") == 2222.0
+
+
+async def test_deep_run_uses_the_deep_sla_budget(monkeypatch):
+    # A Deep run resolves the Deep budget (1680 default, here via the deep env var). With a
+    # clock that never trips it, all claims are judged — the Deep budget is the one in force.
+    captured = {}
+    real_resolve = engine_mod._resolve_sla_seconds
+
+    def _spy_resolve(tier, raw=None):
+        captured["tier"] = tier
+        return real_resolve(tier, raw)
+
+    monkeypatch.setattr(engine_mod, "_resolve_sla_seconds", _spy_resolve)
+    fake = FakeLLMProvider(claim_texts=("A.", "B."))
+    monkeypatch.setattr(engine_mod, "get_llm_provider", lambda *a, **k: fake)
+    report = await verify({"output": "A. B."}, "deep")
+    assert captured["tier"] == "deep"
+    assert len(report.findings) == 2  # generous Deep budget → both claims judged
+
+
+async def test_deep_collects_discovered_sources_excluding_provided(monkeypatch):
+    # A Deep run collects discovered (source, stance) from the findings' grounded evidence,
+    # first-seen deduped and EXCLUDING any buyer-provided url, and passes them to
+    # check_citations. The fake judge grounds each claim on the stub-search evidence sources.
+    captured = {}
+
+    fake = FakeLLMProvider(claim_texts=("A.", "B."), judge_status="supported")
+    monkeypatch.setattr(engine_mod, "get_llm_provider", lambda *a, **k: fake)
+
+    async def _spy_check(output, sources, tier, **kwargs):
+        captured["tier"] = tier
+        captured["discovered"] = kwargs.get("discovered")
+        return []
+
+    monkeypatch.setattr(engine_mod, "check_citations", _spy_check)
+
+    # The stub search provider yields sources like https://stub.local/<slug>/<i>. Provide one
+    # of them as a buyer source so it is EXCLUDED from discovered.
+    report = await verify(
+        {"output": "A. B.", "sources": [{"url": "https://stub.local/a/1"}]}, "deep"
+    )
+    assert captured["tier"] == "deep"
+    discovered = captured["discovered"]
+    # Discovered is a list of (source, stance) tuples; the provided url is excluded; deduped.
+    assert discovered is not None
+    assert all(isinstance(t, tuple) and len(t) == 2 for t in discovered)
+    sources = [s for s, _ in discovered]
+    assert "https://stub.local/a/1" not in sources  # provided url excluded
+    assert len(sources) == len(set(sources))  # first-seen deduped
+    assert all(stance == "supports" for _, stance in discovered)
+    assert isinstance(report, Report)
+
+
+async def test_quick_passes_no_discovered(monkeypatch):
+    # Quick must NOT pass discovered (provided-only).
+    captured = {}
+
+    async def _spy_check(output, sources, tier, **kwargs):
+        captured["discovered"] = kwargs.get("discovered")
+        return []
+
+    monkeypatch.setattr(engine_mod, "check_citations", _spy_check)
+    await verify({"output": "A. B."}, "quick")
+    assert captured["discovered"] is None
+
+
+async def test_deep_sla_early_stop_yields_partial(monkeypatch):
+    # The Deep budget honours the same honest early-stop → partial as Quick.
+    fake = FakeLLMProvider(claim_texts=("c1.", "c2.", "c3."), judge_status="unverifiable")
+    monkeypatch.setattr(engine_mod, "get_llm_provider", lambda *a, **k: fake)
+    monkeypatch.setattr(engine_mod, "_now", _FakeClock([0.0, 100.0, 5000.0]))
+    monkeypatch.setattr(engine_mod, "_resolve_sla_seconds", lambda *a, **k: 1680.0)
+    report = await verify({"output": "c1. c2. c3."}, "deep")
+    assert len(report.findings) == 1
+    assert report.verdict.label == "partial"

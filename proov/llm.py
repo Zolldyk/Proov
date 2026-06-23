@@ -113,6 +113,14 @@ _STUB_JUDGE_CONFIDENCE = 0.5
 _VALID_STATUSES: frozenset[str] = frozenset(("supported", "unsupported", "unverifiable"))
 _VALID_STANCES: frozenset[str] = frozenset(("supports", "refutes", "neutral"))
 
+# Deep multi-pass self-consistency (Story 2.7). `PROOV_DEEP_JUDGE_PASSES` (default 3) is how
+# many times the Deep `judge_claim` entrypoint samples the provider per claim before reducing
+# to one consensus via `_consensus_judgment`; capped at `_MAX_DEEP_PASSES` to bound cost/SLA.
+_DEFAULT_DEEP_PASSES = 3
+_MAX_DEEP_PASSES = 7
+# The consensus merges already-grounded evidence from the winning passes, bounded small.
+_MAX_CONSENSUS_EVIDENCE = 6
+
 
 class LLMError(RuntimeError):
     """A real LLM call failure (transport / HTTP status / timeout / config).
@@ -474,6 +482,73 @@ async def extract_claims(
     return await active.extract_claims(text, cap)
 
 
+def _resolve_deep_passes(raw: str | None = None) -> int:
+    """Resolve `PROOV_DEEP_JUDGE_PASSES`, tolerating garbage by falling back to the default.
+
+    Mirrors the `_resolve_timeout` hardening shape: a missing / non-int / ≤0 value →
+    `_DEFAULT_DEEP_PASSES`; a valid value is capped at `_MAX_DEEP_PASSES` so a misconfigured
+    huge count can't blow the Deep cost/SLA budget. Returns a positive `int`.
+    """
+    raw = raw if raw is not None else os.environ.get("PROOV_DEEP_JUDGE_PASSES")
+    if raw is None:
+        return _DEFAULT_DEEP_PASSES
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_DEEP_PASSES
+    if value <= 0:
+        return _DEFAULT_DEEP_PASSES
+    return min(value, _MAX_DEEP_PASSES)
+
+
+def _consensus_judgment(judgments: list[Judgment]) -> Judgment:
+    """Reduce N self-consistency passes to ONE consensus `Judgment` (pure, deterministic).
+
+    The robustness mechanism behind Deep multi-pass (Story 2.7 / architecture §4). No I/O, no
+    provider call — every input was already produced by `_normalise_judgment`, so every quote
+    is already grounded/bounded (no new fabrication surface). Order-independent so a shuffled
+    set of passes yields an identical consensus (same canonicalisation discipline as
+    `aggregate_verdict`, Story 2.5 review):
+
+    - **Status — majority wins.** The status with the strictly-highest vote count is the label.
+      A tie at the top count (incl. an all-distinct split, e.g. 1/1/1) → `"unverifiable"`
+      (precision over recall, NFR4 — never a coin-flip verdict). A pass degraded to
+      `unverifiable` (thin evidence / `LLMError`) counts as an `unverifiable` vote.
+    - **Confidence** = `clamp_confidence(mean(confidence of the winning-status passes))`
+      down-weighted by agreement `(winning_votes / total_passes)` — unanimity keeps the full
+      mean, a bare majority is penalised. `math.fsum` over a sorted list → order-independent.
+    - **Evidence** = the grounded stances from the winning passes, deduped by
+      `(source, quote, stance)` and deterministically ordered (sorted, so the result is
+      invariant to pass order), bounded to `_MAX_CONSENSUS_EVIDENCE`.
+    """
+    if not judgments:
+        return Judgment("unverifiable", 0.0, ())
+    total = len(judgments)
+
+    counts: dict[str, int] = {}
+    for j in judgments:
+        counts[j.status] = counts.get(j.status, 0) + 1
+    top = max(counts.values())
+    winners = [status for status, count in counts.items() if count == top]
+    if len(winners) != 1:
+        # No unique plurality (tie) → unverifiable. Honest "we couldn't agree" outcome.
+        return Judgment("unverifiable", 0.0, ())
+    status = winners[0]
+
+    winning = [j for j in judgments if j.status == status]
+    mean_conf = math.fsum(sorted(j.confidence for j in winning)) / len(winning)
+    confidence = clamp_confidence(mean_conf * (len(winning) / total))
+
+    unique = {
+        (es.source, es.quote, es.stance) for j in winning for es in j.evidence
+    }
+    evidence = tuple(
+        EvidenceStance(source=source, quote=quote, stance=stance)
+        for source, quote, stance in sorted(unique)
+    )[:_MAX_CONSENSUS_EVIDENCE]
+    return Judgment(status, confidence, evidence)
+
+
 async def judge_claim(
     claim: Claim,
     evidence: list[Evidence],
@@ -485,21 +560,40 @@ async def judge_claim(
     """Provider-agnostic per-claim judgment entrypoint (the engine, Story 2.6, calls this).
 
     Deliberately UNLIKE `extract_claims`, which raises `LLMError` out: judgment is per-claim,
-    and the Story 2.6 engine judges many claims in a loop, so one claim's judge failure must
-    NOT nuke a paid multi-claim order. Thin evidence and a failed call therefore BOTH resolve
-    to the same honest `unverifiable` — this entrypoint **never raises out** (degrade, don't
-    drop — NFR3):
+    and the engine judges many claims in a loop, so one claim's judge failure must NOT nuke a
+    paid multi-claim order. Thin evidence and a failed call therefore BOTH resolve to the same
+    honest `unverifiable` — this entrypoint **never raises out** (degrade, don't drop — NFR3):
 
-    - empty `evidence` → `Judgment("unverifiable", 0.0, ())` with NO provider call;
-    - otherwise delegate to `provider` (or the `get_llm_provider()` default); if the provider
-      raises `LLMError`, log a warning and degrade THIS claim to `unverifiable`.
-
-    `tier`/`options` are accepted for the Story 2.7 Deep multi-pass (self-consistency) seam;
-    the judge is single-pass in this story (architecture §4: Quick single-pass, Deep multi-pass).
+    - empty `evidence` → `Judgment("unverifiable", 0.0, ())` with NO provider call (no
+      multi-pass spend on nothing);
+    - `tier == "quick"`: **single-pass** — delegate once to `provider` (or the
+      `get_llm_provider()` default); an `LLMError` degrades THIS claim to `unverifiable`.
+    - `tier == "deep"`: **multi-pass self-consistency** (Story 2.7 / architecture §4) — sample
+      the provider `_resolve_deep_passes()` times and reduce to one consensus via
+      `_consensus_judgment`. A pass that raises `LLMError` becomes an `unverifiable` vote (the
+      provider already maps `LLMError` → `unverifiable` internally; this catches a pass that
+      still raises out), so the entrypoint never raises. The provider classes and
+      `_normalise_judgment` are unchanged — multi-pass is orchestration here, not new provider
+      logic.
     """
     if not evidence:
         return Judgment("unverifiable", 0.0, ())
     active = provider if provider is not None else get_llm_provider()
+
+    if tier == "deep":
+        votes: list[Judgment] = []
+        for _ in range(_resolve_deep_passes()):
+            try:
+                votes.append(await active.judge_claim(claim, list(evidence)))
+            except LLMError as exc:
+                logger.warning(
+                    "judge_claim Deep pass degraded to unverifiable after provider "
+                    "failure: %r",
+                    exc,
+                )
+                votes.append(Judgment("unverifiable", 0.0, ()))
+        return _consensus_judgment(votes)
+
     try:
         return await active.judge_claim(claim, list(evidence))
     except LLMError as exc:

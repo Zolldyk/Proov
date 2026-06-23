@@ -21,9 +21,10 @@ verifier that cries wolf is worse than useless", PRD §1). Like `retrieve_eviden
 top-level `check_citations` **never raises out** (degrade, don't drop — NFR3): a bad source
 degrades to a conservative non-fabricated `ok`, not a crash and not a false `fabricated`.
 
-This story checks **provided sources only** (architecture §4: Quick = provided only); the
-Deep "provided + discovered" check is Story 2.7 (the `tier`/`options` params are threaded as
-that seam). No `croo` import — engine `[B]` code; `httpx` is allowed (off the SDK path).
+Quick checks **provided sources only** (architecture §4); Deep (Story 2.7) ALSO covers the
+**discovered** sources the retrieval surfaced — flagged at ZERO extra network/LLM cost by
+reusing the stance the judge already assigned (no re-fetch, no re-judge), passed in via the
+`discovered` kwarg. No `croo` import — engine `[B]` code; `httpx` is allowed (off the SDK path).
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ import re
 import httpx
 
 from .llm import judge_claim
-from .types import CitationCheck, CitationFlag, Claim, Evidence, Tier
+from .types import CitationCheck, CitationFlag, Claim, Evidence, Stance, Tier
 
 logger = logging.getLogger("proov.citations")
 
@@ -162,11 +163,12 @@ async def check_citations(
     client: httpx.AsyncClient | None = None,
     options: dict | None = None,
     timeout: float | None = None,
+    discovered: list[tuple[str, Stance]] | None = None,
 ) -> list[CitationCheck]:
-    """Check buyer-provided `sources`, flag each, and NEVER raise out (the engine calls this).
+    """Check buyer-provided `sources` (+ Deep discovered), flag each, and NEVER raise out.
 
-    Empty/missing `sources` → `[]` (no fetch, no judge). Otherwise each source (a
-    `{"url", "title"?}` dict per the validated PRD §6 input) is normalised — trim the url,
+    Empty/missing `sources` → no provided checks (no fetch, no judge). Otherwise each source
+    (a `{"url", "title"?}` dict per the validated PRD §6 input) is normalised — trim the url,
     drop blank-url entries, dedupe by url (first-seen wins), skip non-dict items — then, for
     each unique source, processed **sequentially** (a handful of sources; parallelism is
     Story 3.3): fetch → (map per `_flag_for`) → `CitationCheck`. The support judgment reuses
@@ -180,69 +182,94 @@ async def check_citations(
     misbehaving pluggable provider. `asyncio.CancelledError`/`BaseException` are intentionally
     NOT caught — task cancellation must propagate (mirrors `retrieve_evidence`).
 
-    `tier`/`options` are threaded for the Story 2.7 Deep "provided + discovered" seam; this
-    story checks **provided sources only**. The `fabricated` flag feeds the Story 2.5 verdict.
+    **Deep `discovered` (Story 2.7).** When `tier == "deep"` and `discovered` is non-empty, a
+    `CitationCheck` is appended for each unique discovered `(url, stance)` AFTER the provided
+    ones, flagged from the stance the judge ALREADY assigned during retrieval/judgment — at
+    ZERO new network/LLM cost (NO re-fetch, NO re-judge). A discovered source the engine itself
+    surfaced is honest evidence, so it is `retrievable=True` (it WAS retrieved → never
+    `fabricated`) and `flag="ok"`; `supports_attached_claim` is `True` only for a `supports`
+    stance (`refutes`/`neutral` → `ok` + not-supports; a discovered refuting source is honest
+    evidence, NOT a buyer "misattribution" — `fabricated`/`misattributed` are reserved for
+    buyer-PROVIDED citations, precision over recall). A discovered url equal to a provided one
+    is NOT double-listed. For `tier == "quick"`, `discovered` is ignored (provided-only). The
+    `fabricated` flag (provided-only) feeds the Story 2.5 verdict.
     """
-    if not sources:
-        return []
-
-    # Normalise: drop non-dict items / blank urls, dedupe by url (first-seen wins, order kept).
-    seen: set[str] = set()
-    normalised: list[tuple[str, str]] = []
-    for item in sources:
-        if not isinstance(item, dict):
-            continue
-        # Defend the type, not just the presence: `_sources_ok` validates `url` is a str but
-        # NOT `title`, and unknown callers may pass either un-typed. A non-str `.strip()` here
-        # would raise OUTSIDE the per-source try/except below and break "never raises out".
-        raw_url = item.get("url")
-        url = raw_url.strip() if isinstance(raw_url, str) else ""
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        raw_title = item.get("title")
-        title = raw_title.strip() if isinstance(raw_title, str) else ""
-        normalised.append((url, title))
-
-    if not normalised:
-        return []
-
-    # Caller `timeout` overrides env (mirror `retrieve_evidence`'s caller-timeout shape).
-    per_call = _resolve_timeout(
-        str(timeout) if timeout is not None else os.environ.get("PROOV_CITATION_TIMEOUT")
-    )
-
     results: list[CitationCheck] = []
-    for url, title in normalised:
-        try:
-            retrievable, content = await _fetch_source(
-                url, client=client, timeout=per_call
-            )
-            if not retrievable:
-                # Not retrievable → fabricated. No support judgment attempted (no spend).
-                supports, flag = _flag_for(False, None)
-            elif not content.strip():
-                # Retrievable but unreadable (e.g. JS-rendered / empty body) → ok, no judge.
-                supports, flag = _flag_for(True, None)
-            else:
-                judgment = await judge_claim(
-                    Claim(id="citation-target", text=output[:_MAX_CLAIM_CHARS]),
-                    [Evidence(source=url, title=title, snippet=content)],
-                    tier,
-                    provider=provider,
-                    options=options,
-                )
-                supports, flag = _flag_for(True, judgment.status)
-        except Exception as exc:  # noqa: BLE001
-            # Both helpers already never raise, but a pluggable provider could raise anything;
-            # the "never raises out" contract requires we degrade THIS source, not crash. We
-            # degrade to a conservative NON-fabricated `ok` — never cry wolf on an internal
-            # error. `asyncio.CancelledError` is a BaseException and is NOT caught here, so
-            # task cancellation still propagates.
-            logger.warning("citation check degraded to ok after error for %s: %r", url, exc)
-            supports, flag = (False, "ok")
-            retrievable = True
 
-        results.append(CitationCheck(url, retrievable, supports, flag))
+    if sources:
+        # Normalise: drop non-dict / blank urls, dedupe by url (first-seen wins, order kept).
+        seen: set[str] = set()
+        normalised: list[tuple[str, str]] = []
+        for item in sources:
+            if not isinstance(item, dict):
+                continue
+            # Defend the type, not just the presence: `_sources_ok` validates `url` is a str
+            # but NOT `title`, and unknown callers may pass either un-typed. A non-str
+            # `.strip()` here would raise OUTSIDE the per-source try/except and break "never
+            # raises out".
+            raw_url = item.get("url")
+            url = raw_url.strip() if isinstance(raw_url, str) else ""
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            raw_title = item.get("title")
+            title = raw_title.strip() if isinstance(raw_title, str) else ""
+            normalised.append((url, title))
+
+        if normalised:
+            # Caller `timeout` overrides env (mirror `retrieve_evidence`'s caller-timeout).
+            per_call = _resolve_timeout(
+                str(timeout)
+                if timeout is not None
+                else os.environ.get("PROOV_CITATION_TIMEOUT")
+            )
+
+            for url, title in normalised:
+                try:
+                    retrievable, content = await _fetch_source(
+                        url, client=client, timeout=per_call
+                    )
+                    if not retrievable:
+                        # Not retrievable → fabricated. No support judgment (no spend).
+                        supports, flag = _flag_for(False, None)
+                    elif not content.strip():
+                        # Retrievable but unreadable (JS-rendered / empty body) → ok, no judge.
+                        supports, flag = _flag_for(True, None)
+                    else:
+                        judgment = await judge_claim(
+                            Claim(id="citation-target", text=output[:_MAX_CLAIM_CHARS]),
+                            [Evidence(source=url, title=title, snippet=content)],
+                            tier,
+                            provider=provider,
+                            options=options,
+                        )
+                        supports, flag = _flag_for(True, judgment.status)
+                except Exception as exc:  # noqa: BLE001
+                    # Both helpers already never raise, but a pluggable provider could raise
+                    # anything; the "never raises out" contract requires we degrade THIS
+                    # source, not crash. We degrade to a conservative NON-fabricated `ok` —
+                    # never cry wolf on an internal error. `asyncio.CancelledError` is a
+                    # BaseException and is NOT caught here, so cancellation still propagates.
+                    logger.warning(
+                        "citation check degraded to ok after error for %s: %r", url, exc
+                    )
+                    supports, flag = (False, "ok")
+                    retrievable = True
+
+                results.append(CitationCheck(url, retrievable, supports, flag))
+
+    # Deep "provided + discovered" (Story 2.7): append discovered sources, flagged from the
+    # already-assigned stance at zero new cost. Excludes any url already listed (provided or an
+    # earlier discovered dup). Never appended for Quick.
+    if tier == "deep" and discovered:
+        listed = {cc.source for cc in results}
+        for raw_url, stance in discovered:
+            url = raw_url.strip() if isinstance(raw_url, str) else ""
+            if not url or url in listed:
+                continue
+            listed.add(url)
+            # Honest evidence the engine surfaced: retrievable (it WAS retrieved → not
+            # fabricated), flag `ok`; only a `supports` stance asserts support.
+            results.append(CitationCheck(url, True, stance == "supports", "ok"))
 
     return results

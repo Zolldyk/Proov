@@ -12,12 +12,15 @@ pipeline order.
 Three invariants (architecture §2/§3/§4, NFR2/NFR3):
 
 - **SDK-agnostic.** NO `croo` import — `proov.provider` is the ONLY CROO-coupled module.
-  The engine takes a plain validated input `dict` and returns a pure `Report`, so the
-  future Deep tier (Story 2.7), the human "try this" path (Story 4.1) and the companion
-  caller (Story 4.2) can all invoke verification without the SDK.
-- **Single-pass for Quick.** v1 judges claims sequentially (simplest, deterministic; the
-  bounded-concurrency / worker-pool is explicitly Story 3.3). Quick = single-pass
-  (architecture §4); the multi-pass Deep branch is Story 2.7.
+  The engine takes a plain validated input `dict` and returns a pure `Report`, so both the
+  Quick and Deep tiers, the human "try this" path (Story 4.1) and the companion caller
+  (Story 4.2) can all invoke verification without the SDK.
+- **One orchestration, tier-driven slices.** `verify` runs the SAME ordered single-pass-
+  per-claim loop for BOTH tiers (Story 2.7); the tier is the only switch, and the Deep
+  differentiators (multi-source retrieval, multi-pass self-consistency judgment,
+  provided+discovered citations, the wider SLA budget) live INSIDE the slices / SLA
+  resolver, branched on `tier`. The engine still judges claims sequentially (simplest,
+  deterministic; bounded-concurrency / worker-pool is explicitly Story 3.3).
 - **Never raises out (degrade, don't drop — NFR3).** A paid order is never crashed by the
   engine. Four of the five slices are already total; only `extract_claims` raises
   (`LLMError`), so only that call is wrapped — an extraction failure degrades to zero
@@ -37,32 +40,40 @@ import os
 from .citations import check_citations
 from .llm import LLMError, extract_claims, get_llm_provider, judge_claim
 from .search import retrieve_evidence
-from .types import ClaimFinding, Report, Tier
+from .types import ClaimFinding, Report, Stance, Tier
 from .verdict import aggregate_verdict
 
 logger = logging.getLogger("proov.engine")
 
-# Per-order SLA budget (NFR2): Quick's wall is 5 min; the default 240s leaves ~60s headroom
-# for canonicalise + deliver_order + async settlement. Worker-pool concurrency is Story 3.3.
-_DEFAULT_SLA_SECONDS = 240.0
+# Per-order SLA budget (NFR2), per tier. Quick's wall is 5 min → 240s leaves ~60s headroom;
+# Deep's wall is 30 min → 1680s (28 min) leaves ~2 min for canonicalise + (big-report)
+# upload_file + deliver_order + async settlement. Worker-pool concurrency is Story 3.3.
+_DEFAULT_QUICK_SLA_SECONDS = 240.0
+_DEFAULT_DEEP_SLA_SECONDS = 1680.0
 
 
-def _resolve_sla_seconds(raw: str | None = None) -> float:
-    """Parse `PROOV_QUICK_SLA_SECONDS`, tolerating garbage by falling back to the default.
+def _resolve_sla_seconds(tier: Tier, raw: str | None = None) -> float:
+    """Resolve the per-order SLA budget for `tier`, tolerating garbage with the tier default.
 
-    Mirrors the `_resolve_timeout` hardening in `search.py`/`llm.py`/`citations.py`: a
-    missing / non-numeric / non-finite (`inf`/`nan`) / ≤0 value → `_DEFAULT_SLA_SECONDS`.
-    An infinite or zero budget would defeat the per-order SLA bound (NFR2).
+    Reads `PROOV_DEEP_SLA_SECONDS` (default `_DEFAULT_DEEP_SLA_SECONDS`) for `"deep"`, else
+    `PROOV_QUICK_SLA_SECONDS` (default `_DEFAULT_QUICK_SLA_SECONDS`). Mirrors the
+    `_resolve_timeout` hardening in `search.py`/`llm.py`/`citations.py`: a missing /
+    non-numeric / non-finite (`inf`/`nan`) / ≤0 value → that tier's default. An infinite or
+    zero budget would defeat the per-order SLA bound (NFR2).
     """
-    raw = raw if raw is not None else os.environ.get("PROOV_QUICK_SLA_SECONDS")
+    if tier == "deep":
+        env_var, default = "PROOV_DEEP_SLA_SECONDS", _DEFAULT_DEEP_SLA_SECONDS
+    else:
+        env_var, default = "PROOV_QUICK_SLA_SECONDS", _DEFAULT_QUICK_SLA_SECONDS
+    raw = raw if raw is not None else os.environ.get(env_var)
     if raw is None:
-        return _DEFAULT_SLA_SECONDS
+        return default
     try:
         value = float(raw)
     except (TypeError, ValueError):
-        return _DEFAULT_SLA_SECONDS
+        return default
     if not math.isfinite(value) or value <= 0:
-        return _DEFAULT_SLA_SECONDS
+        return default
     return value
 
 
@@ -126,12 +137,13 @@ async def verify(input: dict, tier: Tier, *, options: dict | None = None) -> Rep
     else:
         opts = options or input_opts or None
 
-    # Per-order SLA deadline (NFR2). Captured once at TRUE entry — BEFORE extraction — so the
-    # budget bounds the WHOLE single-pass pipeline (extraction + judging loop), leaving ~60s
-    # headroom under Quick's 5-min wall. Checked at the TOP of each judging iteration so we
+    # Per-order SLA deadline (NFR2), per tier. Captured once at TRUE entry — BEFORE extraction
+    # — so the budget bounds the WHOLE single-pass pipeline (extraction + judging loop): ~60s
+    # headroom under Quick's 5-min wall, ~2 min under Deep's 30-min wall. Checked at the TOP of
+    # each judging iteration so we
     # never hard-cancel mid-await (which would lose the in-flight finding and risk a
     # CancelledError escaping). Sequential judging; bounded concurrency is Story 3.3.
-    deadline = _now() + _resolve_sla_seconds()
+    deadline = _now() + _resolve_sla_seconds(tier)
 
     # Resolve the LLM provider ONCE so the stamped model is the one that judged (FR14).
     # A config error (missing key / unknown provider) must not crash a paid order — degrade
@@ -166,7 +178,8 @@ async def verify(input: dict, tier: Tier, *, options: dict | None = None) -> Rep
     for index, claim in enumerate(claims):
         if _now() >= deadline:
             logger.warning(
-                "Quick SLA budget hit, stopping after %d/%d claims → partial",
+                "%s SLA budget hit, stopping after %d/%d claims → partial",
+                tier,
                 index,
                 len(claims),
             )
@@ -176,7 +189,33 @@ async def verify(input: dict, tier: Tier, *, options: dict | None = None) -> Rep
         findings.append(ClaimFinding(claim=claim, judgment=judgment))
 
     # (c) Citation check over the buyer-provided sources (provided-source order preserved).
-    citations = await check_citations(output_text, sources, tier, options=opts)
+    # Deep ALSO covers DISCOVERED sources (architecture §4 "provided + discovered"): the unique
+    # evidence-source URLs retrieval surfaced across the run, flagged from the stance the judge
+    # already assigned — collected here at zero extra cost (NO re-fetch/re-judge) and passed to
+    # `check_citations`. Provided urls are excluded so they are not double-listed. Quick passes
+    # nothing (provided-only).
+    if tier == "deep":
+        provided_urls = {
+            src.get("url").strip()
+            for src in sources
+            if isinstance(src, dict)
+            and isinstance(src.get("url"), str)
+            and src["url"].strip()
+        }
+        discovered: list[tuple[str, Stance]] = []
+        seen_sources: set[str] = set()
+        for finding in findings:
+            for stance_item in finding.judgment.evidence:
+                source = stance_item.source
+                if source in seen_sources or source in provided_urls:
+                    continue
+                seen_sources.add(source)
+                discovered.append((source, stance_item.stance))
+        citations = await check_citations(
+            output_text, sources, tier, options=opts, discovered=discovered
+        )
+    else:
+        citations = await check_citations(output_text, sources, tier, options=opts)
 
     # (d) Deterministic aggregation (pure/total — consumed unchanged).
     verdict = aggregate_verdict([f.judgment for f in findings], list(citations), options=opts)

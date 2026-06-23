@@ -44,6 +44,7 @@ from urllib.parse import quote
 
 import httpx
 
+from .cache import EvidenceCache, evidence_cache_key, get_evidence_cache
 from .redaction import register_secret
 from .types import Evidence, Tier, evidence_k_for_tier
 
@@ -340,6 +341,7 @@ async def retrieve_evidence(
     providers: list[SearchProvider] | None = None,
     options: dict | None = None,
     timeout: float | None = None,
+    cache: EvidenceCache | None = None,
 ) -> list[Evidence]:
     """Provider-agnostic evidence-retrieval entrypoint (the engine, Story 2.6, calls this).
 
@@ -347,12 +349,27 @@ async def retrieve_evidence(
     each provider **in order under `asyncio.wait_for`**. On a provider raising `SearchError`
     OR timing out, it logs a warning and falls through to the next provider (FR7 fallback).
 
-    Chain-stop policy: **stop at the first provider that returns ≥1 evidence** (cheapest;
-    matches architecture §4 "≈1 source/claim" for Quick), falling through only on
-    failure / timeout / empty. Cross-provider merge for Deep is a Story 2.7 refinement — the
-    `_normalise_evidence` cap/dedupe seam is already in place for it.
+    **Claim→evidence cache (Story 2.8, FR11).** Before building the chain, the
+    `(query, tier, k)`-keyed cache is consulted: a HIT returns the stored evidence with **zero**
+    search-provider calls. On a miss the chain runs and a **non-empty** result is stored (an
+    empty result is NOT cached — caching `[]` would pin a transient outage as "no evidence" for
+    the whole TTL). The cache is **best-effort**: every cache failure degrades to a miss/no-op,
+    so it never changes the never-raises-out contract or the data the live path would return —
+    it only changes timing/cost. Inject `cache=` (e.g. a `:memory:` `SqliteEvidenceCache`) to
+    override the memoised default (the suite injects / disables it).
 
-    If every provider fails / times out / yields nothing, returns `[]` — a valid "no
+    Chain-stop policy is **tier-keyed** (architecture §4):
+
+    - `tier == "quick"`: **stop at the first provider that returns ≥1 evidence** (cheapest;
+      "≈1 source/claim"), falling through only on failure / timeout / empty.
+    - `tier == "deep"`: **multi-source merge** — query EVERY provider in the chain, accumulate
+      their results, and return `_normalise_evidence(combined, k)` (dedupe-by-source first-seen,
+      snippet-bounded, capped to the Deep `k`). A failed/timed-out provider simply contributes
+      nothing to the merge rather than aborting it.
+
+    Either way each provider is called under the per-call `asyncio.wait_for` timeout, and a
+    `SearchError`/timeout/unexpected exception logs a warning and falls through to the next
+    (FR7). If every provider fails / times out / yields nothing, returns `[]` — a valid "no
     evidence" outcome that makes the claim `unverifiable` downstream (degrade, don't drop —
     NFR3). This function NEVER raises out.
     """
@@ -360,6 +377,20 @@ async def retrieve_evidence(
         return []
 
     k = evidence_k_for_tier(tier, options)
+    # Cache-first (Story 2.8): a hit short-circuits the whole provider chain — zero search
+    # calls. The cache is best-effort: the built-in `SqliteEvidenceCache` already swallows its
+    # own failures, but the guard here also protects the never-raises-out contract from a
+    # MISBEHAVING injected cache (`asyncio.CancelledError` is a BaseException — not caught here,
+    # so cancellation still propagates). A failure → treat as a miss and run the live search.
+    active_cache = cache if cache is not None else get_evidence_cache()
+    key = evidence_cache_key(query, tier, k)
+    try:
+        cached = await active_cache.get(key)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Evidence cache get raised, falling back to live search: %r", exc)
+        cached = None
+    if cached is not None:
+        return cached
     # Building the chain can itself raise (a misconfigured PROOV_SEARCH_PROVIDER, or `tavily`
     # selected with no key). The "never raises out" contract means a config error must degrade
     # to "no evidence" (claim → unverifiable, NFR3), not crash a paid order.
@@ -374,6 +405,11 @@ async def retrieve_evidence(
         str(timeout) if timeout is not None else os.environ.get("PROOV_SEARCH_TIMEOUT")
     )
 
+    deep = tier == "deep"
+    merged: list[Evidence] = []  # Deep accumulator (unused for Quick).
+    # Both the Quick first-non-empty path and the Deep merged-at-end path funnel through this
+    # single local so the one cache-put + return below applies to both (Story 2.8).
+    result: list[Evidence] = []
     for provider in chain:
         try:
             evidence = await asyncio.wait_for(provider.search(query, k), per_call)
@@ -389,6 +425,23 @@ async def retrieve_evidence(
             # intentionally NOT caught here, so task cancellation still propagates.
             logger.warning("Search provider raised unexpectedly, falling through: %r", exc)
             continue
-        if evidence:
-            return _normalise_evidence(evidence, k)
-    return []
+        if not evidence:
+            continue
+        if deep:
+            # Deep: accumulate across ALL providers; dedupe/cap happens once at the end.
+            merged.extend(evidence)
+        else:
+            # Quick: first non-empty provider wins (cheapest).
+            result = _normalise_evidence(evidence, k)
+            break
+    if deep and merged:
+        result = _normalise_evidence(merged, k)
+    # Cache only a non-empty result (Story 2.8): caching `[]` would persist a transient outage
+    # as "no evidence" for the TTL. `put` is best-effort — a misbehaving injected cache must not
+    # break the never-raises-out contract (CancelledError still propagates).
+    if result:
+        try:
+            await active_cache.put(key, result)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Evidence cache put raised, skipping store: %r", exc)
+    return result

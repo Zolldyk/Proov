@@ -28,6 +28,7 @@ from proov.search import (
     get_search_provider,
     retrieve_evidence,
 )
+from proov.cache import NullCache, SqliteEvidenceCache
 from proov.types import Evidence
 
 # Realistic-length dummy — never a 1-2 char key (register_secret over-redacts short literals).
@@ -392,6 +393,138 @@ async def test_retrieve_dedupes_and_caps_provider_output():
     )
     ev = await retrieve_evidence("q", "quick", providers=[dup])
     assert [e.source for e in ev] == ["https://x", "https://y"]
+
+
+# --------------------------------------------------------------------------- Deep multi-source merge
+
+
+async def test_deep_merges_across_all_providers():
+    # Deep queries EVERY provider and returns the merged union (both providers consulted).
+    first = _SpyProvider([Evidence(source="https://a", title="t", snippet="a")])
+    second = _SpyProvider([Evidence(source="https://b", title="t", snippet="b")])
+    ev = await retrieve_evidence("q", "deep", providers=[first, second])
+    assert sorted(e.source for e in ev) == ["https://a", "https://b"]
+    assert first.calls == [("q", 6)]  # deep tier k = DEEP_EVIDENCE_K
+    assert second.calls == [("q", 6)]  # second IS consulted (unlike Quick)
+
+
+async def test_deep_dedupes_merged_sources_first_seen():
+    # A source returned by BOTH providers is listed once (first-seen wins, order preserved).
+    first = _SpyProvider(
+        [
+            Evidence(source="https://dup", title="first", snippet="a"),
+            Evidence(source="https://only-a", title="t", snippet="a2"),
+        ]
+    )
+    second = _SpyProvider(
+        [
+            Evidence(source="https://dup", title="second", snippet="b"),
+            Evidence(source="https://only-b", title="t", snippet="b2"),
+        ]
+    )
+    ev = await retrieve_evidence("q", "deep", providers=[first, second])
+    assert [e.source for e in ev] == [
+        "https://dup",
+        "https://only-a",
+        "https://only-b",
+    ]
+    assert ev[0].title == "first"  # first-seen across the merge wins
+
+
+async def test_deep_merge_caps_to_k():
+    # The merged union is capped to the Deep k (6) even when the providers return more.
+    first = _SpyProvider(
+        [Evidence(source=f"https://a/{i}", title="t", snippet="a") for i in range(5)]
+    )
+    second = _SpyProvider(
+        [Evidence(source=f"https://b/{i}", title="t", snippet="b") for i in range(5)]
+    )
+    ev = await retrieve_evidence("q", "deep", providers=[first, second])
+    assert len(ev) == 6  # DEEP_EVIDENCE_K
+
+
+async def test_deep_tolerates_failing_provider_in_chain():
+    # A failing provider contributes nothing but does NOT abort the merge — the survivor's
+    # results still come through.
+    fail = _FailProvider()
+    spy = _SpyProvider([Evidence(source="https://x", title="t", snippet="hit")])
+    ev = await retrieve_evidence("q", "deep", providers=[fail, spy])
+    assert [e.source for e in ev] == ["https://x"]
+    assert fail.calls == 1
+    assert spy.calls == [("q", 6)]
+
+
+async def test_deep_all_empty_returns_empty():
+    # Every provider yields nothing → [] (claim → unverifiable downstream).
+    a = _SpyProvider([])
+    b = _SpyProvider([])
+    assert await retrieve_evidence("q", "deep", providers=[a, b]) == []
+
+
+# --------------------------------------------------------------------------- cache wire-in (Story 2.8)
+
+
+class _RaisingCache:
+    """A cache whose `get` raises — proves the wire-in degrades to a live search, never raises."""
+
+    async def get(self, key):
+        raise RuntimeError("cache exploded")
+
+    async def put(self, key, evidence):
+        raise RuntimeError("cache exploded")
+
+
+async def test_cache_hit_skips_search():
+    # The core AC: a second identical call is served from cache with ZERO extra search calls.
+    cache = SqliteEvidenceCache(":memory:")
+    spy = _SpyProvider([Evidence(source="https://a", title="t", snippet="s")])
+    first = await retrieve_evidence("q", "quick", providers=[spy], cache=cache)
+    assert len(spy.calls) == 1
+    second = await retrieve_evidence("q", "quick", providers=[spy], cache=cache)
+    assert second == first
+    assert len(spy.calls) == 1  # unchanged — served from cache, no new search call
+
+
+async def test_cache_miss_on_different_tier_anti_poison():
+    # A Quick entry must NOT be served to a Deep request (different result shape).
+    cache = SqliteEvidenceCache(":memory:")
+    spy = _SpyProvider([Evidence(source="https://a", title="t", snippet="s")])
+    await retrieve_evidence("q", "quick", providers=[spy], cache=cache)
+    assert len(spy.calls) == 1
+    await retrieve_evidence("q", "deep", providers=[spy], cache=cache)
+    assert len(spy.calls) == 2  # miss — the spy is called again
+
+
+async def test_cache_miss_on_different_k_anti_poison():
+    cache = SqliteEvidenceCache(":memory:")
+    spy = _SpyProvider([Evidence(source="https://a", title="t", snippet="s")])
+    await retrieve_evidence("q", "quick", providers=[spy], cache=cache, options={"k": 1})
+    assert len(spy.calls) == 1
+    await retrieve_evidence("q", "quick", providers=[spy], cache=cache, options={"k": 2})
+    assert len(spy.calls) == 2  # different k → different key → miss
+
+
+async def test_empty_result_is_not_cached():
+    cache = SqliteEvidenceCache(":memory:")
+    spy = _SpyProvider([])  # always empty
+    await retrieve_evidence("q", "quick", providers=[spy], cache=cache)
+    await retrieve_evidence("q", "quick", providers=[spy], cache=cache)
+    assert len(spy.calls) == 2  # [] never cached — re-attempted every time
+
+
+async def test_null_cache_behaves_as_uncached():
+    spy = _SpyProvider([Evidence(source="https://a", title="t", snippet="s")])
+    await retrieve_evidence("q", "quick", providers=[spy], cache=NullCache())
+    await retrieve_evidence("q", "quick", providers=[spy], cache=NullCache())
+    assert len(spy.calls) == 2  # every call hits the chain
+
+
+async def test_cache_error_degrades_to_live_search():
+    spy = _SpyProvider([Evidence(source="https://a", title="t", snippet="s")])
+    # A get-raising cache must not crash the order — it degrades to a live search.
+    ev = await retrieve_evidence("q", "quick", providers=[spy], cache=_RaisingCache())
+    assert len(ev) == 1
+    assert len(spy.calls) == 1
 
 
 # --------------------------------------------------------------------------- conformance + factory/chain

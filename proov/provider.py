@@ -41,12 +41,36 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import signal
 from typing import Any
 
 from .config import AppConfig
 
 logger = logging.getLogger("proov.provider")
+
+# Deep big-report delivery (Story 2.7): a Deep deliverable whose canonical bytes reach this
+# threshold is ALSO uploaded via `upload_file` and linked by a `report_file` sibling. 50 KB
+# default; garbage / ≤0 → default (mirrors the hardened timeout-var resolvers elsewhere).
+_DEFAULT_DEEP_UPLOAD_THRESHOLD_BYTES = 51200
+
+
+def _resolve_upload_threshold(raw: str | None = None) -> int:
+    """Resolve `PROOV_DEEP_UPLOAD_THRESHOLD_BYTES`, tolerating garbage with the default.
+
+    A missing / non-int / ≤0 value → `_DEFAULT_DEEP_UPLOAD_THRESHOLD_BYTES`. Returns the
+    byte size at or above which a Deep deliverable is uploaded as a downloadable full copy.
+    """
+    raw = raw if raw is not None else os.environ.get("PROOV_DEEP_UPLOAD_THRESHOLD_BYTES")
+    if raw is None:
+        return _DEFAULT_DEEP_UPLOAD_THRESHOLD_BYTES
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_DEEP_UPLOAD_THRESHOLD_BYTES
+    if value <= 0:
+        return _DEFAULT_DEEP_UPLOAD_THRESHOLD_BYTES
+    return value
 
 
 class FatalProviderError(RuntimeError):
@@ -308,6 +332,45 @@ class ProviderAdapter:
                 # can only reproduce `content_hash` by re-canonicalising. Delivering canonical
                 # JSON makes that round-trip exact. (Story 1.4 Task 1 empirical finding.)
                 deliverable_schema = canonical_json(payload)
+
+                # Story 2.7 — Deep big-report delivery. When a DEEP deliverable's canonical
+                # bytes reach the threshold, ALSO upload those EXACT bytes as a downloadable
+                # full copy and link them via a `report_file` sibling. The uploaded bytes are
+                # the artifact whose `report_hash` the file reproduces; `report_file` is added
+                # AFTER `build_deliverable` computed the receipt, so it is a post-receipt
+                # sibling (like `receipt`/`verified_by_proov`) and does NOT change `report_hash`
+                # — only the whole-deliverable `content_hash` covers it. Best-effort in its OWN
+                # try/except: any upload error degrades to inline delivery WITHOUT `report_file`
+                # (the file is a convenience download, never the verdict — an upload hiccup must
+                # not drop a paid order). Quick and sub-threshold Deep (incl. the small
+                # graceful-degrade deliverable) never reach the upload call.
+                canonical_bytes = deliverable_schema.encode("utf-8")
+                if tier == "deep" and len(canonical_bytes) >= _resolve_upload_threshold():
+                    try:
+                        object_key = await self._client.upload_file(
+                            f"proov-report-{order_id}.json", canonical_bytes
+                        )
+                        download_url = await self._client.get_download_url(object_key)
+                        payload_with_file = {
+                            **payload,
+                            "report_file": {
+                                "object_key": object_key,
+                                "download_url": download_url,
+                                "size_bytes": len(canonical_bytes),
+                            },
+                        }
+                        deliverable_schema = canonical_json(payload_with_file)
+                        payload = payload_with_file
+                    except Exception as upload_exc:  # noqa: BLE001
+                        # Degrade, don't drop: keep the original inline `deliverable_schema`
+                        # (no `report_file`). `asyncio.CancelledError` is a BaseException and is
+                        # NOT caught here, so task cancellation still propagates.
+                        logger.warning(
+                            "report upload failed for order %s; delivering inline without "
+                            "report_file (degrade, don't drop): %r",
+                            order_id,
+                            upload_exc,
+                        )
             except Exception as fatal_build_exc:
                 # Could not build/serialise a deliverable even after the graceful degrade —
                 # reject so escrow refunds, and mark terminal so a re-emit does not retry the

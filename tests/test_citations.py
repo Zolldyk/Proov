@@ -396,3 +396,114 @@ async def test_check_citations_never_raises():
             client=client,
         )
     assert result == [CitationCheck("https://x.example", True, False, "ok")]
+
+
+# ----------------------------------------------- Deep provided + discovered (Story 2.7)
+
+
+async def test_deep_appends_discovered_after_provided_no_new_fetch_or_judge():
+    spy = _CitationJudgeSpy(status="supported")
+    fetches = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        fetches["n"] += 1
+        return httpx.Response(200, text=_html("backs the output"))
+
+    async with _mock_fetch_client(handler) as client:
+        result = await check_citations(
+            "the output",
+            [{"url": "https://provided.example"}],
+            "deep",
+            provider=spy,
+            client=client,
+            discovered=[
+                ("https://disc-supports.example", "supports"),
+                ("https://disc-refutes.example", "refutes"),
+                ("https://disc-neutral.example", "neutral"),
+            ],
+        )
+    # Provided first, then discovered appended in order.
+    assert result == [
+        CitationCheck("https://provided.example", True, True, "ok"),
+        CitationCheck("https://disc-supports.example", True, True, "ok"),
+        CitationCheck("https://disc-refutes.example", True, False, "ok"),
+        CitationCheck("https://disc-neutral.example", True, False, "ok"),
+    ]
+    # Discovered cost NOTHING extra: only the one provided source was fetched, and the judge
+    # was only ever handed the provided url's evidence — no discovered url was re-fetched or
+    # re-judged. (The provided source's support judgment is itself Deep multi-pass.)
+    assert fetches["n"] == 1
+    judged_sources = {ev.source for _claim, evs in spy.calls for ev in evs}
+    assert judged_sources == {"https://provided.example"}
+
+
+async def test_deep_discovered_never_fabricated_or_misattributed():
+    # A discovered refuting/neutral source is honest evidence — never fabricated/misattributed.
+    result = await check_citations(
+        "the output",
+        None,
+        "deep",
+        discovered=[("https://r.example", "refutes")],
+    )
+    assert result == [CitationCheck("https://r.example", True, False, "ok")]
+    assert all(cc.flag == "ok" for cc in result)
+
+
+async def test_deep_discovered_not_double_listed_when_equal_to_provided():
+    spy = _CitationJudgeSpy(status="supported")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=_html("content"))
+
+    async with _mock_fetch_client(handler) as client:
+        result = await check_citations(
+            "the output",
+            [{"url": "https://same.example"}],
+            "deep",
+            provider=spy,
+            client=client,
+            discovered=[
+                ("https://same.example", "supports"),  # equals the provided url → skip
+                ("https://other.example", "supports"),
+            ],
+        )
+    assert result == [
+        CitationCheck("https://same.example", True, True, "ok"),  # the PROVIDED check wins
+        CitationCheck("https://other.example", True, True, "ok"),
+    ]
+
+
+async def test_deep_discovered_dedupes_among_themselves():
+    result = await check_citations(
+        "out",
+        None,
+        "deep",
+        discovered=[
+            ("https://dup.example", "supports"),
+            ("https://dup.example", "refutes"),  # first-seen wins → supports
+            ("https://x.example", "neutral"),
+        ],
+    )
+    assert result == [
+        CitationCheck("https://dup.example", True, True, "ok"),
+        CitationCheck("https://x.example", True, False, "ok"),
+    ]
+
+
+async def test_quick_ignores_discovered():
+    spy = _CitationJudgeSpy(status="supported")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=_html("content"))
+
+    async with _mock_fetch_client(handler) as client:
+        result = await check_citations(
+            "the output",
+            [{"url": "https://provided.example"}],
+            "quick",
+            provider=spy,
+            client=client,
+            discovered=[("https://disc.example", "supports")],
+        )
+    # Quick is provided-only — the discovered source is NOT listed.
+    assert result == [CitationCheck("https://provided.example", True, True, "ok")]

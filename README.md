@@ -17,7 +17,13 @@ verdict aggregation — are built and tested. As of Story 2.6 the **Quick Check*
 the whole engine end-to-end: a paid Quick order is verified single-pass and delivered as a
 real, schema-valid JSON deliverable whose `verdict`/`confidence`/`claims`/`citations_checked`/
 `stats` are the actual aggregated result, with the real model id in a fully populated,
-independently verifiable receipt. The Deep Verify (multi-pass) path is the next story.
+independently verifiable receipt. As of Story 2.7 the **Deep Verify** path is live: it runs
+the SAME pipeline keyed on `tier == "deep"` — multi-source evidence merge, multi-pass
+(self-consistency) judgment, provided+discovered citations and a 28-min SLA budget — and, for
+large reports, also delivers a downloadable full copy via `upload_file` + `get_download_url`
+linked from a `report_file` sibling, alongside the same independently verifiable receipt. As of
+Story 2.8 a repeated claim is served from a TTL'd SQLite **claim→evidence cache** with no new
+search-provider call — the cost/latency enabler of the $0-marginal model at volume.
 
 ## How it works
 
@@ -196,8 +202,9 @@ by both providers, plus the top-level `judge_claim` entrypoint.
 
 When a buyer supplies `sources` with their output, `proov/citations.py` checks each provided
 source and flags it `ok` / `fabricated` / `misattributed` for the `citations_checked[]` field.
-This is the **provided-sources-only** path (Quick); Deep's "discovered sources" check is
-Story 2.7.
+This is the **provided-sources-only** path (Quick); Deep's "discovered sources" check lands in
+Story 2.7 (see **Deep Verify** below) — it appends the engine-surfaced evidence URLs flagged
+from their already-assigned stance, at zero extra fetch/judge cost.
 
 - **Two signals, one fetch.** Retrievability is a small injectable `httpx` GET of the source
   URL (status < 400, redirects followed); the fetched, HTML-stripped body doubles as the
@@ -269,6 +276,76 @@ trail, citation flags, stats and a tamper-evident on-chain receipt — no longer
   only a belt-and-suspenders backstop. No new dependency; one new env var
   (`PROOV_QUICK_SLA_SECONDS`).
 
+### Deep Verify (Story 2.7)
+
+Deep Verify ($0.50, SLA <30 min) runs the **same** `verify(input, tier)` orchestration as
+Quick — extract → (per claim) retrieve + judge → check citations → aggregate → deliverable.
+The tier is the only switch; the four Deep differentiators live **inside the slices**, keyed on
+`tier == "deep"` (the engine, deliverable builder, receipt and Quick path are untouched):
+
+- **Multi-source evidence merge.** `retrieve_evidence` queries **every** provider in the chain
+  (Tavily → Wikipedia) and returns the deduped, capped union (`k = 6`), rather than stopping at
+  the first non-empty provider as Quick does. A failed provider contributes nothing rather than
+  aborting the merge.
+- **Multi-pass (self-consistency) judgment.** The `judge_claim` entrypoint samples the provider
+  `PROOV_DEEP_JUDGE_PASSES` times (default 3, capped at 7) per claim and reduces the passes to
+  one consensus: **majority status wins; a tie → `unverifiable`** (precision over recall, never
+  a coin-flip), and confidence is the agreement-weighted mean of the winning passes (unanimity
+  keeps the full mean, a bare majority is penalised). Deterministic and order-independent.
+- **Provided + discovered citations.** Beyond the buyer's provided `sources`, the Deep citation
+  list **also** covers the **discovered** sources retrieval surfaced — flagged from the stance
+  the judge already assigned, at **zero** extra fetch/LLM cost (no re-fetch, no re-judge). A
+  discovered source is honest evidence: always `retrievable`, flagged `ok`, never `fabricated`
+  (only buyer-provided citations can be `fabricated`/`misattributed`).
+- **28-min SLA budget.** `PROOV_DEEP_SLA_SECONDS` (default 1680s) bounds the whole pipeline, with
+  the same honest early-stop → `partial` as Quick. (Bounded-concurrency to hit the wall on a
+  worst-case 50-claim order is **Story 3.3**; Deep still judges claims sequentially here.)
+
+**Big-report delivery.** The verdict + receipt **always** deliver inline as the anchored,
+schema-valid deliverable. When a Deep deliverable's canonical bytes reach
+`PROOV_DEEP_UPLOAD_THRESHOLD_BYTES` (default 50 KB), the provider ALSO uploads those exact bytes
+via the SDK's `upload_file`, gets a `get_download_url` link, and adds a `report_file`
+`{object_key, download_url, size_bytes}` **sibling** (a downloadable full copy). The upload is
+best-effort in its own `try/except`: any failure degrades to inline delivery **without**
+`report_file` — the file is a convenience, never the verdict, so an upload hiccup never drops a
+paid order. `report_file` is added **after** the receipt is computed (like `receipt` /
+`verified_by_proov`), so it does **not** change `report_hash` — see "Verifying a receipt".
+
+No new dependency; three new env vars (`PROOV_DEEP_SLA_SECONDS`, `PROOV_DEEP_JUDGE_PASSES`,
+`PROOV_DEEP_UPLOAD_THRESHOLD_BYTES`).
+
+### Claim→evidence cache (Story 2.8)
+
+`proov/cache.py` adds a TTL'd, SQLite-backed **claim→evidence cache** `[E]`, wired transparently
+into `retrieve_evidence` so the engine and both tiers get it for free. A repeated claim is served
+from cache with **zero** search-provider calls — the cost/latency enabler of the $0-marginal model
+at volume (FR11).
+
+- **Key = `(normalised claim, tier, k)`.** The claim text is lower-cased and whitespace-collapsed,
+  then `sha256`-ed together with the tier and evidence count `k`. Including tier + `k` (not the bare
+  claim) means a Quick entry (single source, `k=3`) can never poison a Deep read (the 6-item
+  multi-source merge), and a result capped at one `k` is never served for a different `k`.
+- **Hit skips search; only non-empty results are cached.** A cache hit returns the stored evidence
+  directly. An empty result is **not** cached — caching `[]` would pin a transient search outage as
+  "no evidence" for the whole TTL; an empty result is simply re-attempted next time.
+- **Best-effort — degrade, don't drop.** Every SQLite/JSON failure degrades to a miss (`get`) /
+  no-op (`put`) / `NullCache` (factory). The cache can only make a paid order faster/cheaper; it can
+  never fail it or change a verdict (`retrieve_evidence` still never raises out). The hit returns the
+  already-normalised list the live path would have produced — the cache changes timing/cost, never
+  the data.
+- **One lock-guarded connection, off-loaded via `asyncio.to_thread`,** so the always-on WebSocket
+  event loop + heartbeat is never blocked on disk I/O, and `:memory:` / file both work.
+
+```
+PROOV_CACHE_ENABLED=1            # cache on by default; 0/false/no/off disables (→ NullCache)
+PROOV_CACHE_PATH=proov_cache.db  # SQLite file (gitignored via *.db); :memory: also works
+PROOV_CACHE_TTL_SECONDS=86400    # entry lifetime in seconds (24 h); garbage falls back to 86400
+```
+
+The test suite runs with caching **disabled** (an autouse fixture sets `PROOV_CACHE_ENABLED=0`), so
+no `proov_cache.db` is written and existing behaviour is unchanged. No new dependency (`sqlite3` is
+stdlib). The order/metrics ledger that will share this `[E]` slot is Story 3.2.
+
 ## Input/output contract
 
 The submitted input is the negotiation's `requirements` JSON string:
@@ -295,6 +372,11 @@ The delivered output:
                "anchor_ref": {} },
   "disclaimer": "string" }
 ```
+
+A large **Deep** deliverable additionally carries an optional `report_file`
+`{ "object_key": "…", "download_url": "https://…", "size_bytes": 0 }` — a link to a downloadable
+full copy of the canonical deliverable. It is a post-receipt sibling (like `verified_by_proov`),
+so it is excluded when reproducing `report_hash`.
 
 ## Input validation & graceful failure
 
@@ -377,8 +459,10 @@ assert keccak256_hex(canonical_json(obj).encode("utf-8")) == delivery.content_ha
    `deliver_tx_hash` (open it on [BaseScan](https://basescan.org)).
 4. **Recompute the inner hashes:**
    - `output_hash = keccak256(utf8(<the input output text>))`.
-   - `report_hash = keccak256(utf8(canonical_json(deliverable without the receipt and
-     verified_by_proov keys)))`. (The receipt can't hash a structure that contains itself.)
+   - `report_hash = keccak256(utf8(canonical_json(deliverable without the receipt,
+     verified_by_proov, and report_file keys)))`. (The receipt can't hash a structure that
+     contains itself; `report_file` — present only on large Deep deliverables — is a
+     post-receipt sibling, so it is stripped too.)
 
 > `anchor_ref` is **not** a tx hash. The receipt lives inside the deliverable and `content_hash
 > = keccak256(whole deliverable)`. Writing the deliver tx into the receipt would change the very
@@ -421,7 +505,8 @@ new runtime dependency, no I/O.
    sibling of `receipt`, with `anchor: null` and `receipt_id = report_hash` (the deliver tx isn't
    known pre-delivery, and embedding it would change the hashed bytes). It is added *after* the
    receipt is computed, so `report_hash` is unchanged — a verifier reproducing `report_hash` must
-   strip **both** `receipt` and `verified_by_proov` before re-canonicalising.
+   strip `receipt` and `verified_by_proov` (and, on a large Deep deliverable, the `report_file`
+   sibling) before re-canonicalising.
 2. **Post-delivery, tx-bearing artifact** — assembled after `deliver_order` returns, carrying a
    concrete `anchor = { order_id, content_hash, deliver_tx_hash, delivery_id, chain, explorer_url }`
    and `receipt_id = content_hash`.

@@ -17,9 +17,13 @@ from proov.llm import (
     LLMError,
     LLMProvider,
     StubLLMProvider,
+    _MAX_CONSENSUS_EVIDENCE,
+    _MAX_DEEP_PASSES,
     _MAX_QUOTE_CHARS,
+    _consensus_judgment,
     _normalise_claims,
     _normalise_judgment,
+    _resolve_deep_passes,
     _resolve_timeout,
     extract_claims,
     get_llm_provider,
@@ -555,10 +559,154 @@ async def test_top_level_judge_llmerror_degrades_to_unverifiable():
     assert result == Judgment("unverifiable", 0.0, ())  # never raises out
 
 
-async def test_top_level_judge_passes_provider_result_through():
+async def test_top_level_judge_quick_is_single_pass_passthrough():
+    # Quick judgment delegates ONCE and passes the provider result straight through.
     canned = Judgment("supported", 0.6, (EvidenceStance("https://a", "q", "supports"),))
     spy = _JudgeSpyProvider(result=canned)
-    result = await judge_claim(_CLAIM, [_EV1, _EV2], "deep", provider=spy)
+    result = await judge_claim(_CLAIM, [_EV1, _EV2], "quick", provider=spy)
     assert result == canned
     assert len(spy.calls) == 1
     assert spy.calls[0][0] == _CLAIM
+
+
+# ------------------------------------------------------- Deep multi-pass self-consistency (Story 2.7)
+
+
+class _CountingJudgeProvider:
+    """A fake judge provider whose `judge_claim` returns a scripted result per call.
+
+    Drives Deep multi-pass: each call pops the next scripted `Judgment` (or raises the next
+    scripted exception), so a test can vary statuses across the self-consistency passes.
+    """
+
+    def __init__(self, results: list) -> None:
+        self._results = list(results)
+        self.calls = 0
+
+    async def judge_claim(self, claim: Claim, evidence: list[Evidence]) -> Judgment:
+        item = self._results[self.calls]
+        self.calls += 1
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def test_resolve_deep_passes_hardening():
+    # default 3; garbage / ≤0 → 3; valid honoured; over-cap clamped to _MAX_DEEP_PASSES.
+    assert _resolve_deep_passes(None) == 3
+    assert _resolve_deep_passes("5") == 5
+    assert _resolve_deep_passes("nonsense") == 3
+    assert _resolve_deep_passes("3.5") == 3  # non-int string → default
+    assert _resolve_deep_passes("0") == 3
+    assert _resolve_deep_passes("-2") == 3
+    assert _resolve_deep_passes("999") == _MAX_DEEP_PASSES  # capped
+
+
+def test_consensus_empty_is_unverifiable():
+    assert _consensus_judgment([]) == Judgment("unverifiable", 0.0, ())
+
+
+def test_consensus_unanimous_keeps_full_confidence():
+    es = EvidenceStance("https://a", "q", "supports")
+    passes = [Judgment("supported", 0.9, (es,)) for _ in range(3)]
+    result = _consensus_judgment(passes)
+    assert result.status == "supported"
+    assert result.confidence == pytest.approx(0.9)  # agreement 3/3 → full mean
+    assert result.evidence == (es,)
+
+
+def test_consensus_majority_down_weights_confidence():
+    # 2 supported (0.9 each) + 1 unsupported → supported, mean*agreement = 0.9 * (2/3).
+    passes = [
+        Judgment("supported", 0.9, (EvidenceStance("https://a", "q", "supports"),)),
+        Judgment("supported", 0.9, (EvidenceStance("https://a", "q", "supports"),)),
+        Judgment("unsupported", 0.8, (EvidenceStance("https://b", "r", "refutes"),)),
+    ]
+    result = _consensus_judgment(passes)
+    assert result.status == "supported"
+    assert result.confidence == pytest.approx(0.9 * (2 / 3))
+    # Evidence is only the winning (supported) passes' grounded stances, deduped.
+    assert result.evidence == (EvidenceStance("https://a", "q", "supports"),)
+
+
+def test_consensus_three_way_split_is_unverifiable():
+    passes = [
+        Judgment("supported", 0.9, ()),
+        Judgment("unsupported", 0.9, ()),
+        Judgment("unverifiable", 0.9, ()),
+    ]
+    assert _consensus_judgment(passes) == Judgment("unverifiable", 0.0, ())
+
+
+def test_consensus_even_tie_is_unverifiable():
+    # 2 vs 2 at the top count → no unique plurality → unverifiable.
+    passes = [
+        Judgment("supported", 0.9, ()),
+        Judgment("supported", 0.9, ()),
+        Judgment("unsupported", 0.9, ()),
+        Judgment("unsupported", 0.9, ()),
+    ]
+    assert _consensus_judgment(passes) == Judgment("unverifiable", 0.0, ())
+
+
+def test_consensus_is_order_independent():
+    import random
+
+    passes = [
+        Judgment("supported", 0.7, (EvidenceStance("https://a", "qa", "supports"),)),
+        Judgment("supported", 0.9, (EvidenceStance("https://b", "qb", "supports"),)),
+        Judgment("unsupported", 0.5, (EvidenceStance("https://c", "qc", "refutes"),)),
+    ]
+    baseline = _consensus_judgment(passes)
+    for _ in range(5):
+        shuffled = passes[:]
+        random.shuffle(shuffled)
+        assert _consensus_judgment(shuffled) == baseline
+
+
+def test_consensus_caps_merged_evidence():
+    # Winning passes carrying many distinct stances are bounded to _MAX_CONSENSUS_EVIDENCE.
+    big = tuple(
+        EvidenceStance(f"https://s/{i}", f"q{i}", "supports") for i in range(20)
+    )
+    passes = [Judgment("supported", 0.8, big) for _ in range(3)]
+    result = _consensus_judgment(passes)
+    assert len(result.evidence) == _MAX_CONSENSUS_EVIDENCE
+
+
+async def test_deep_judge_majority_consensus():
+    # 3 passes: supported, supported, unsupported → consensus supported (majority).
+    es = EvidenceStance("https://a", "q", "supports")
+    provider = _CountingJudgeProvider(
+        [
+            Judgment("supported", 0.9, (es,)),
+            Judgment("supported", 0.9, (es,)),
+            Judgment("unsupported", 0.8, (EvidenceStance("https://b", "r", "refutes"),)),
+        ]
+    )
+    result = await judge_claim(_CLAIM, [_EV1, _EV2], "deep", provider=provider)
+    assert provider.calls == 3  # multi-pass: sampled PROOV_DEEP_JUDGE_PASSES (default 3) times
+    assert result.status == "supported"
+    assert result.confidence == pytest.approx(0.9 * (2 / 3))
+
+
+async def test_deep_judge_raising_pass_counts_as_unverifiable_vote():
+    # A pass that raises LLMError becomes an unverifiable vote; never raises out. Here:
+    # supported, LLMError(→unverifiable), unverifiable → unverifiable wins (2 of 3).
+    provider = _CountingJudgeProvider(
+        [
+            Judgment("supported", 0.9, (EvidenceStance("https://a", "q", "supports"),)),
+            LLMError("pass 2 down"),
+            Judgment("unverifiable", 0.4, ()),
+        ]
+    )
+    result = await judge_claim(_CLAIM, [_EV1], "deep", provider=provider)
+    assert provider.calls == 3
+    assert result.status == "unverifiable"
+
+
+async def test_deep_judge_empty_evidence_short_circuits_no_passes():
+    spy = _JudgeSpyProvider()
+    result = await judge_claim(_CLAIM, [], "deep", provider=spy)
+    assert result == Judgment("unverifiable", 0.0, ())
+    assert spy.calls == []  # no multi-pass spend on nothing

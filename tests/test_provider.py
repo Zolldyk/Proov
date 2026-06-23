@@ -23,9 +23,13 @@ from croo import (
     Order,
 )
 from proov.config import AppConfig
-from proov.provider import FatalProviderError, ProviderAdapter
+from proov.provider import (
+    FatalProviderError,
+    ProviderAdapter,
+    _resolve_upload_threshold,
+)
 from proov.receipt import canonical_json, keccak256_hex
-from proov.services import QUICK_SERVICE_ID
+from proov.services import DEEP_SERVICE_ID, QUICK_SERVICE_ID
 
 _DUMMY_KEY = "croo_sk_dummy_test_key"
 # Sample submitted input the test buyer would negotiate (Negotiation.requirements JSON).
@@ -111,6 +115,10 @@ class FakeClient:
         self.deliver_error: Exception | None = None
         self.reject_negotiation_error: Exception | None = None
         self.reject_order_error: Exception | None = None
+        # Story 2.7 object-storage methods (big-report upload).
+        self.upload_calls: list[tuple[str, bytes]] = []
+        self.download_url_calls: list[str] = []
+        self.upload_error: Exception | None = None
         # Override per-test to exercise the malformed-requirements path.
         self.requirements: str = _SAMPLE_REQUIREMENTS
 
@@ -156,6 +164,16 @@ class FakeClient:
         self.reject_order_calls.append((order_id, reason))
         if self.reject_order_error is not None:
             raise self.reject_order_error
+
+    async def upload_file(self, file_name: str, body):
+        self.upload_calls.append((file_name, bytes(body)))
+        if self.upload_error is not None:
+            raise self.upload_error
+        return f"obj/{file_name}"
+
+    async def get_download_url(self, object_key: str):
+        self.download_url_calls.append(object_key)
+        return f"https://dl.test/{object_key}"
 
     async def deliver_order(self, order_id: str, req):
         self.deliver_calls.append((order_id, req))
@@ -300,6 +318,114 @@ async def test_delivered_schema_carries_in_band_verified_by_proov_badge():
     assert badge["anchor"] is None  # tx/content_hash not known pre-delivery
     assert badge["receipt_id"] == delivered["receipt"]["report_hash"]
     assert badge["schema"] == "proov.verified-by-proov.v1"
+
+
+# ---------------------------------------------- Deep big-report upload (Story 2.7)
+
+
+def test_resolve_upload_threshold_hardening():
+    # default 51200; garbage / non-int / ≤0 → default; a valid value is honoured.
+    assert _resolve_upload_threshold(None) == 51200
+    assert _resolve_upload_threshold("1024") == 1024
+    assert _resolve_upload_threshold("nonsense") == 51200
+    assert _resolve_upload_threshold("0") == 51200
+    assert _resolve_upload_threshold("-5") == 51200
+
+
+async def test_deep_large_report_uploaded_and_linked(monkeypatch):
+    # With a low threshold a Deep deliverable is uploaded and linked via `report_file`; the
+    # sibling does NOT change the embedded report_hash (strip receipt+badge+report_file).
+    monkeypatch.setenv("PROOV_DEEP_UPLOAD_THRESHOLD_BYTES", "10")
+    stream = FakeEventStream()
+    client = FakeClient(stream, service_id=DEEP_SERVICE_ID)
+    adapter = ProviderAdapter(_cfg(), client=client)
+    await adapter.start()
+
+    stream.dispatch(_event(type=EventType.ORDER_PAID, order_id="ord-deep"))
+    await _drain(adapter)
+
+    assert len(client.deliver_calls) == 1
+    assert len(client.upload_calls) == 1
+    file_name, uploaded_bytes = client.upload_calls[0]
+    assert file_name == "proov-report-ord-deep.json"
+    assert client.download_url_calls == ["obj/proov-report-ord-deep.json"]
+
+    _, req = client.deliver_calls[0]
+    delivered = json.loads(req.deliverable_schema)
+    rf = delivered["report_file"]
+    assert rf["object_key"] == "obj/proov-report-ord-deep.json"
+    assert rf["download_url"] == f"https://dl.test/{rf['object_key']}"
+    assert rf["size_bytes"] == len(uploaded_bytes)
+
+    # `report_file` is a post-receipt sibling: stripping receipt + verified_by_proov +
+    # report_file reproduces report_hash from the delivered bytes.
+    receipt = delivered["receipt"]
+    body = {
+        k: v
+        for k, v in delivered.items()
+        if k not in ("receipt", "verified_by_proov", "report_file")
+    }
+    assert keccak256_hex(canonical_json(body).encode("utf-8")) == receipt["report_hash"]
+
+    # The UPLOADED bytes are the canonical deliverable WITHOUT report_file → the downloaded
+    # file (minus receipt+badge) also reproduces report_hash.
+    uploaded = json.loads(uploaded_bytes.decode("utf-8"))
+    assert "report_file" not in uploaded
+    ubody = {k: v for k, v in uploaded.items() if k not in ("receipt", "verified_by_proov")}
+    assert keccak256_hex(canonical_json(ubody).encode("utf-8")) == receipt["report_hash"]
+
+
+async def test_deep_upload_failure_degrades_to_inline_delivery(monkeypatch, caplog):
+    # An upload that RAISES must not drop the order: it delivers inline WITHOUT report_file.
+    monkeypatch.setenv("PROOV_DEEP_UPLOAD_THRESHOLD_BYTES", "10")
+    stream = FakeEventStream()
+    client = FakeClient(stream, service_id=DEEP_SERVICE_ID)
+    client.upload_error = RuntimeError("upload flaked")
+    adapter = ProviderAdapter(_cfg(), client=client)
+    await adapter.start()
+
+    with caplog.at_level(logging.WARNING):
+        stream.dispatch(_event(type=EventType.ORDER_PAID, order_id="ord-deep-fail"))
+        await _drain(adapter)
+
+    assert len(client.deliver_calls) == 1  # still delivered (never dropped)
+    _, req = client.deliver_calls[0]
+    delivered = json.loads(req.deliverable_schema)
+    assert "report_file" not in delivered
+    assert client.reject_order_calls == []  # best-effort upload, not a fatal build error
+
+
+async def test_quick_order_never_uploads(monkeypatch):
+    # The tier gate: even with a tiny threshold, a Quick order never calls upload.
+    monkeypatch.setenv("PROOV_DEEP_UPLOAD_THRESHOLD_BYTES", "1")
+    stream = FakeEventStream()
+    client = FakeClient(stream, service_id=QUICK_SERVICE_ID)
+    adapter = ProviderAdapter(_cfg(), client=client)
+    await adapter.start()
+
+    stream.dispatch(_event(type=EventType.ORDER_PAID, order_id="ord-quick"))
+    await _drain(adapter)
+
+    assert len(client.deliver_calls) == 1
+    assert client.upload_calls == []
+    delivered = json.loads(client.deliver_calls[0][1].deliverable_schema)
+    assert "report_file" not in delivered
+
+
+async def test_deep_sub_threshold_does_not_upload():
+    # A small Deep deliverable below the (default 50KB) threshold delivers inline, no upload.
+    stream = FakeEventStream()
+    client = FakeClient(stream, service_id=DEEP_SERVICE_ID)
+    adapter = ProviderAdapter(_cfg(), client=client)
+    await adapter.start()
+
+    stream.dispatch(_event(type=EventType.ORDER_PAID, order_id="ord-deep-small"))
+    await _drain(adapter)
+
+    assert len(client.deliver_calls) == 1
+    assert client.upload_calls == []
+    delivered = json.loads(client.deliver_calls[0][1].deliverable_schema)
+    assert "report_file" not in delivered
 
 
 async def test_handle_order_paid_returns_tx_bearing_artifact():
