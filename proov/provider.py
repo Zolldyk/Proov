@@ -279,6 +279,9 @@ class ProviderAdapter:
                 # auto-refunds the Requester. We do NOT deliver. Terminal (no re-reject).
                 await self._client.reject_order(order_id, result.reason)
                 terminal = True
+                # Story 3.2: record this terminal (rejected) order best-effort, after it is
+                # already rejected/refunding — a ledger failure cannot affect the reject.
+                await self._record_order(order, tier, "rejected")
                 logger.info(
                     "rejected paid order (escrow refund): order_id=%s code=%s",
                     order_id,
@@ -377,6 +380,8 @@ class ProviderAdapter:
                 # same deterministic failure forever (poison message).
                 await self._client.reject_order(order_id, "internal_verification_error")
                 terminal = True
+                # Story 3.2: record this terminal (rejected) order best-effort.
+                await self._record_order(order, tier, "rejected")
                 logger.exception(
                     "rejected paid order (escrow refund) — could not build/serialise a "
                     "deliverable even after graceful degrade: order_id=%s: %s",
@@ -409,6 +414,14 @@ class ProviderAdapter:
                 order_id,
                 content_hash,
                 payload["receipt"]["output_hash"],
+            )
+            # Story 3.2: mirror this terminal order into the metrics ledger (best-effort, in its
+            # OWN try/except, AFTER the order is anchored on-chain). The full counterparty/wallet/
+            # price come from `order` (the get_order result), while the status is the freshest
+            # delivery-time snapshot ("delivering" — CLEAR is async); the dashboard's list_orders
+            # reconciliation supplies the live "completed" later.
+            await self._record_order(
+                order, tier, getattr(delivered, "status", "") or "delivering"
             )
             # Story 1.6: assemble the post-delivery, tx-bearing "Verified by Proov" artifact
             # (FR16) from data already in hand — the receipt + the now-known on-chain anchor.
@@ -468,6 +481,63 @@ class ProviderAdapter:
             return ""
         neg = await self._client.get_negotiation(negotiation_id)
         return getattr(neg, "requirements", "") or ""
+
+    # --- metrics ledger (Story 3.2, best-effort) --------------------------------
+
+    @staticmethod
+    def _parse_usd(raw: Any) -> float | None:
+        """Parse `Order.price` (a base-units USDC string) to scaled USD, or `None` if unknown.
+
+        `order.price` is a string in `payment_token` base units (USDC = 6 decimals); we record
+        the human-readable USD (`/1e6`) so revenue/margin read naturally on the dashboard
+        (Open Question 4 — scaled USD). A missing / non-numeric price → `None` (distinct from a
+        real `0.0`), so an unparseable price never reports a misleading $0 of revenue.
+        """
+        try:
+            value = float(raw) / 1_000_000
+        except (TypeError, ValueError):
+            return None
+        # A non-finite (inf/nan) or negative price is garbage that would poison revenue/margin —
+        # reject it to `None` (the same finite guard `metrics.estimate_order_cost` applies to cost).
+        if value != value or value in (float("inf"), float("-inf")) or value < 0:
+            return None
+        return value
+
+    async def _record_order(self, order: Any, tier: str, status: str) -> None:
+        """Mirror a TERMINAL order into the metrics ledger — best-effort, never breaks delivery.
+
+        Built from the `Order` already in hand (no new SDK call in the hot path): identity +
+        counterparty + wallet + price come from `order`; `cost_usd` from the documented
+        `estimate_order_cost(tier)` seam (Story 3.4 replaces it with a measured counter). The
+        whole body is its OWN `try/except` (log-and-swallow) and `get_order_ledger().record` is
+        itself best-effort — double-guarded — and it is only ever called AFTER the order is
+        already terminal (delivered/rejected), so a ledger failure can NEVER roll back the
+        idempotency guard, trip the outer `except` (a misleading "failed to deliver"), or fail a
+        delivered/anchored order (NFR3). `asyncio.CancelledError` is a `BaseException` and is NOT
+        caught, so task cancellation still propagates.
+        """
+        try:
+            from .ledger import get_order_ledger
+            from .metrics import OrderRecord, estimate_order_cost
+
+            record = OrderRecord(
+                order_id=getattr(order, "order_id", "") or "",
+                status=status,
+                tier=tier,
+                requester_agent_id=getattr(order, "requester_agent_id", "") or "",
+                requester_wallet_address=getattr(order, "requester_wallet_address", "") or "",
+                provider_agent_id=getattr(order, "provider_agent_id", "") or "",
+                price_usd=self._parse_usd(getattr(order, "price", "")),
+                cost_usd=estimate_order_cost(tier),
+            )
+            await get_order_ledger().record(record)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "order ledger record skipped for order %s (best-effort, not a delivery "
+                "failure): %r",
+                getattr(order, "order_id", None),
+                exc,
+            )
 
     # --- lifecycle --------------------------------------------------------------
 

@@ -121,6 +121,12 @@ class FakeClient:
         self.upload_error: Exception | None = None
         # Override per-test to exercise the malformed-requirements path.
         self.requirements: str = _SAMPLE_REQUIREMENTS
+        # Story 3.2 metrics-ledger fields the returned Order carries (empty by default → the
+        # Order's own defaults, so existing tests are unaffected; set per-test to assert the
+        # recorded counterparty/wallet/price).
+        self.order_requester_agent_id: str = ""
+        self.order_requester_wallet_address: str = ""
+        self.order_price: str = ""
 
     async def connect_websocket(self):
         return self._stream
@@ -147,6 +153,9 @@ class FakeClient:
             service_id=self._service_id,
             negotiation_id=f"neg-of-{order_id}",
             status="paid",
+            requester_agent_id=self.order_requester_agent_id,
+            requester_wallet_address=self.order_requester_wallet_address,
+            price=self.order_price,
         )
 
     async def reject_negotiation(self, negotiation_id: str, reason: str):
@@ -186,6 +195,28 @@ class FakeClient:
             delivery=Delivery(delivery_id="dlv-1", order_id=order_id, content_hash="0xanchor"),
             tx_hash="0xdeadbeef",
         )
+
+
+class FakeLedger:
+    """In-memory `OrderLedger` stand-in (Story 3.2) — records, or raises on demand.
+
+    Injected via `monkeypatch.setattr(proov.ledger, "get_order_ledger", lambda: fake)`; the
+    provider's `_record_order` lazily imports the factory so the patch is honoured. With
+    `raise_on_record=True` it simulates a broken ledger to prove the record hook is best-effort
+    (a delivered order still delivers).
+    """
+
+    def __init__(self, *, raise_on_record: bool = False) -> None:
+        self.records: list = []
+        self._raise = raise_on_record
+
+    async def record(self, record) -> None:
+        if self._raise:
+            raise RuntimeError("ledger boom")
+        self.records.append(record)
+
+    async def all_orders(self) -> list:
+        return list(self.records)
 
 
 def _event(**kwargs):
@@ -735,6 +766,87 @@ async def test_graceful_shutdown_awaits_stream_close():
     assert adapter._fatal_error is None
     assert stream.closed is True
     assert client.closed is True
+
+
+# ---------------------------------------------- Metrics ledger record hook (Story 3.2)
+
+
+async def test_delivered_order_is_recorded_to_ledger(monkeypatch):
+    # A successful delivery records the expected OrderRecord (order_id/tier/status/counterparty/
+    # wallet/price/cost) to the injected ledger; status is the delivery-time snapshot.
+    import proov.ledger as ledger_mod
+
+    monkeypatch.delenv("PROOV_QUICK_COST_USD", raising=False)
+    fake = FakeLedger()
+    monkeypatch.setattr(ledger_mod, "get_order_ledger", lambda: fake)
+
+    stream = FakeEventStream()
+    client = FakeClient(stream)
+    client.order_requester_agent_id = "buyer-agent"
+    client.order_requester_wallet_address = "0xbuyer"
+    client.order_price = "100000"  # 0.10 USDC in base units (6 decimals)
+    adapter = ProviderAdapter(_cfg(), client=client)
+    await adapter.start()
+
+    stream.dispatch(_event(type=EventType.ORDER_PAID, order_id="ord-led"))
+    await _drain(adapter)
+
+    assert len(client.deliver_calls) == 1  # delivered
+    assert len(fake.records) == 1
+    rec = fake.records[0]
+    assert rec.order_id == "ord-led"
+    assert rec.tier == "quick"
+    assert rec.status == "delivering"  # the snapshot — CLEAR/"completed" is async
+    assert rec.requester_agent_id == "buyer-agent"
+    assert rec.requester_wallet_address == "0xbuyer"
+    assert rec.price_usd == 0.10  # base units scaled to USD
+    assert rec.cost_usd == 0.0  # documented free-tier estimate (Story 3.4 measures it)
+
+
+async def test_ledger_failure_does_not_break_delivery(monkeypatch, caplog):
+    # NFR3 "degrade, don't drop": a ledger that RAISES on record must not drop/reject the order
+    # nor trip the outer except — the order still delivers and returns its artifact unchanged.
+    import proov.ledger as ledger_mod
+
+    fake = FakeLedger(raise_on_record=True)
+    monkeypatch.setattr(ledger_mod, "get_order_ledger", lambda: fake)
+
+    stream = FakeEventStream()
+    client = FakeClient(stream)
+    adapter = ProviderAdapter(_cfg(), client=client)
+    await adapter.start()
+
+    with caplog.at_level(logging.ERROR, logger="proov.provider"):
+        artifact = await adapter._handle_order_paid("ord-led-fail")
+
+    assert len(client.deliver_calls) == 1  # still delivered
+    assert client.reject_order_calls == []  # not rejected
+    assert artifact is not None  # the tx-bearing artifact is unchanged
+    assert "ord-led-fail" in adapter._delivered_orders  # idempotency guard stays set
+    # The outer except (which logs "failed to deliver") was NOT tripped.
+    assert not any("failed to deliver order" in r.getMessage() for r in caplog.records)
+
+
+async def test_rejected_order_is_recorded_with_rejected_status(monkeypatch):
+    # A malformed paid order is reject_order'd (escrow refund) AND recorded with status="rejected".
+    import proov.ledger as ledger_mod
+
+    fake = FakeLedger()
+    monkeypatch.setattr(ledger_mod, "get_order_ledger", lambda: fake)
+
+    stream = FakeEventStream()
+    client = FakeClient(stream)
+    client.requirements = "not-json{"
+    adapter = ProviderAdapter(_cfg(), client=client)
+    await adapter.start()
+
+    stream.dispatch(_event(type=EventType.ORDER_PAID, order_id="ord-rej-led"))
+    await _drain(adapter)
+
+    assert len(client.reject_order_calls) == 1
+    assert len(fake.records) == 1
+    assert fake.records[0].order_id == "ord-rej-led"
+    assert fake.records[0].status == "rejected"
 
 
 async def test_secret_key_never_appears_in_logs(caplog):

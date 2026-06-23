@@ -27,7 +27,10 @@ search-provider call — the cost/latency enabler of the $0-marginal model at vo
 the engine is **calibrated to the ≥80%-precision bar** (NFR4, precision over recall): verdict
 precision is measured against a committed ~50-row hand-labeled set and gated offline, and the
 `fabricated` citation flag is tightened to fire only on a definitive 404/410 — no more false alarms
-on paywalled / rate-limited / transiently-down sources.
+on paywalled / rate-limited / transiently-down sources. As of Story 3.2 **order metrics are
+instrumented**: the provider mirrors every terminal order into a best-effort SQLite ledger, and
+`scripts/dashboard.py` reconciles it with real `list_orders` to surface the success metrics and the
+**counter-metrics** (self-trade ratio, cost/order) that prove a win is real.
 
 ## How it works
 
@@ -385,6 +388,45 @@ precision leak the earlier reviews deferred here.
 - **Gated in the suite ($0, offline).** `tests/test_calibration.py` asserts the pooled, `unsupported`
   and `fabricated` precisions all clear 0.80, that every thin-evidence row resolves to
   `unverifiable` (100%), and that at least one flag class is below 1.0 (so the gate is meaningful).
+
+### Metrics + counter-metric dashboard (Story 3.2)
+
+A win built on concentrated self-trade, or a tier that loses money at its price, is **not** a real
+win (PRD §1). So alongside the success metrics, Proov surfaces the **counter-metrics** that catch us
+"winning wrong" — and the whole thing reads **real order data**.
+
+- **Two metric kinds.** *Success:* total orders, completed, completion rate, unique buyer wallets
+  (and **external** wallets), unique counterparties. *Counter-metrics:* **self-trade ratio**
+  (own/companion orders ÷ all — external orders must dominate) and **cost / order** (must stay
+  ≈$0 marginal). The third PRD counter-metric, false-fail rate, is the Story 3.1 precision bar —
+  not re-done here. Every ratio is **undefined (`n/a`) on a zero denominator**, never a misleading
+  `0%` — an empty ledger does not report "0% complete".
+- **`list_orders` + a local SQLite ledger, reconciled.** Neither source alone is enough.
+  `AgentClient.list_orders()` is the **authoritative** order truth — it sees the async `completed`
+  status that lands ~1 min **after** `deliver_order` returns (CLEAR/settlement is server-side, and
+  pushed to the *Requester*, so Proov's own delivery-time snapshot is `delivering`, not yet
+  `completed`). But the live `Order` has **no tier and no cost** field. So a best-effort SQLite
+  **ledger** (`proov/ledger.py`) records, at each terminal order, the facts only Proov knows (tier +
+  per-order cost) plus a snapshot for offline use. The dashboard joins them by `order_id`: **live
+  status wins**, the **ledger supplies tier + cost**.
+- **`proov/metrics.py` is pure; `proov/ledger.py` is best-effort.** The numbers a human acts on are
+  computed by a pure, deterministic `compute_metrics` (the `proov/verdict.py` / `proov/calibration.py`
+  template — no `croo`, no I/O, same inputs ⇒ same numbers). The ledger touches disk inside the
+  always-on event loop, so it mirrors the cache's discipline: one lock-guarded connection,
+  `asyncio.to_thread`-offloaded, every failure degrades to a no-op. The provider's record hook is
+  **double-guarded** and runs only **after** an order is already terminal — it can never slow or
+  fail a paid order (NFR3).
+- **Run it.** `python scripts/dashboard.py` prints the dashboard **offline** from the local ledger —
+  **$0, no keys, no network** (the ledger's snapshot status, honest except the `delivering→completed`
+  lag). `python scripts/dashboard.py --live` instead reads real `list_orders` (provider role) and
+  reconciles it with the ledger (live status wins; ledger supplies tier/cost) — operator-only, needs
+  keys, never run by the test suite.
+- **Self-trade config.** `PROOV_OWN_AGENT_IDS` (comma-separated) marks Proov's own/companion agent
+  ids; until the companion Research caller's id is minted in Epic 4.2 it is empty and the self-trade
+  ratio is honestly `n/a`/`0%`. **$0 cost stance:** `cost / order` is the documented free-tier `0.0`
+  today (overridable via `PROOV_QUICK_COST_USD` / `PROOV_DEEP_COST_USD`); a measured per-order cost
+  and a ceiling are Story 3.4 — this dashboard makes the $0-marginal claim **visible and falsifiable**
+  now.
 
 ## Input/output contract
 
