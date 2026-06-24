@@ -49,6 +49,7 @@ from proov.companion import (  # noqa: E402
     compose_delivery,
     extract_verified_artifact,
     make_research_output,
+    render_companion_delivery_markdown,
 )
 from proov.config import AppConfig, ConfigError  # noqa: E402
 from proov.redaction import install_secret_redaction, register_secret  # noqa: E402
@@ -168,6 +169,10 @@ async def _run(cfg: AppConfig, service_id: str) -> int:
                 composed.get("verified"),
             )
             print(json.dumps(composed, indent=2))
+            # Story 4.3: show the badge literally "rendering on a caller's delivery" (FR16 in use).
+            # When the order anchored on-chain this is the tx-bearing badge (BaseScan link); offline
+            # / pre-funding it is the honest in-band preview. Markdown to stdout is enough for the demo.
+            print("\n" + render_companion_delivery_markdown(composed))
         except Exception as exc:
             log.error("compose/get_delivery failed for %s: %s", order_id, exc)
         finally:

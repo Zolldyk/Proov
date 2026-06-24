@@ -28,6 +28,7 @@ from proov.badge import (
     build_anchor,
     build_verified_artifact,
     explorer_tx_url,
+    render_badge_markdown,
 )
 
 # A small built-in, Wikipedia-checkable sample output to verify — the same factual sentence the
@@ -135,7 +136,8 @@ def compose_delivery(
     A JSON-serialisable dict carrying the `research_output`, the Proov `verdict`/`confidence`
     (read from the artifact), the embedded `verified_by_proov` artifact (FR16), a `verified`
     flag, and a `proov_order` reference (`order_id` + the BaseScan explorer URL for the deliver
-    tx). Pure — no I/O. The object a downstream consumer (or Story 4.3's badge render) reads.
+    tx). Pure — no I/O. The object a downstream consumer reads, and the input to the Story 4.3
+    badge render (`render_companion_delivery_markdown`) the runner prints.
 
     `verified` means the output **passed** Proov verification: it is True only when a genuine
     Proov badge is attached AND its verdict is `"pass"`. A failing/partial/unverifiable verdict —
@@ -173,3 +175,64 @@ def compose_delivery(
         "verified_by_proov": verified_artifact,
         "proov_order": {"order_id": proov_order_id, "explorer_url": explorer_url},
     }
+
+
+def _fenced_block(text: str) -> str:
+    """Wrap (caller-controlled) text in a collision-safe Markdown code fence.
+
+    The research output is the caller's own free text rendered next to the real "Verified by Proov"
+    badge — fencing it renders any injected headings, links, or a spoofed badge line inert (defence
+    in depth / the same escaping discipline every badge value already gets). The fence is one
+    backtick longer than the longest backtick run in the text (CommonMark collision-safe fencing),
+    so content containing ``` cannot break out.
+    """
+    longest = 0
+    run = 0
+    for ch in text:
+        if ch == "`":
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}\n{text}\n{fence}"
+
+
+def render_companion_delivery_markdown(delivery: dict) -> str:
+    """Render the companion's composed delivery in a VISIBLE Markdown form (Story 4.3, AC6).
+
+    Takes a `compose_delivery(...)` output and embeds the **rendered** "Verified by Proov" badge
+    (`render_badge_markdown` of `delivery["verified_by_proov"]`) alongside the `research_output`
+    and the `proov_order` reference — so the badge literally "renders on a caller's delivery"
+    (FR16 in use). The runner (`scripts/research_caller.py`) prints this to stdout.
+
+    Pure (no I/O) and **additive**: it does NOT change `compose_delivery`'s JSON shape (the 4.2
+    contract / AC6) — it only reads the delivery and returns a string, never mutating it. Honest
+    by construction: the badge renderer says "preview — not anchored" for an in-band artifact and
+    shows the BaseScan link only for a tx-bearing one (AC2/AC3), and degrades on a missing/error
+    artifact (AC8) rather than raising.
+    """
+    d = delivery if isinstance(delivery, dict) else {}
+    badge_markdown = render_badge_markdown(d.get("verified_by_proov"))
+    order = d.get("proov_order") if isinstance(d.get("proov_order"), dict) else {}
+    order_id = order.get("order_id")
+    explorer_url = order.get("explorer_url")
+
+    lines = [
+        "## Research Companion — verified delivery",
+        "",
+        badge_markdown,
+        "",
+        "**Research output:**",
+        "",
+        _fenced_block(str(d.get("research_output", ""))),
+    ]
+    if order_id:
+        lines += ["", f"Proov order: {order_id}"]
+    if isinstance(explorer_url, str) and explorer_url.startswith("https://"):
+        # Mirror render_badge_markdown's autolink hardening: strip the only chars that can break
+        # out of an angle-bracket Markdown link destination (`>`/newlines). Only an `https://` URL
+        # is emitted (no fabricated/`javascript:` link).
+        safe_url = explorer_url.replace("\n", "").replace("\r", "").replace(">", "%3E")
+        lines.append(f"On-chain: <{safe_url}>")
+    return "\n".join(lines)

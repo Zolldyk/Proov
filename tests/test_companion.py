@@ -20,6 +20,7 @@ from proov.companion import (
     compose_delivery,
     extract_verified_artifact,
     make_research_output,
+    render_companion_delivery_markdown,
 )
 from proov.deliverable import build_deliverable
 from proov.types import (
@@ -275,3 +276,61 @@ def test_full_offline_composition_pipeline_no_socket():
     composed = compose_delivery(research_output=output, verified_artifact=artifact, proov_order_id="o")
     assert composed["verified"] is True
     assert composed["research_output"] == output
+
+
+# --- Story 4.3 AC6: render the rendered badge ON the companion's caller delivery ---------------
+
+
+def test_render_companion_delivery_embeds_badge_tx_bearing():
+    deliverable = _real_deliverable()
+    artifact = extract_verified_artifact(
+        deliverable, content_hash="0xc", deliver_tx_hash="0xabc123", order_id="ord-9"
+    )
+    composed = compose_delivery(
+        research_output="The Eiffel Tower is in Paris.",
+        verified_artifact=artifact,
+        proov_order_id="ord-9",
+    )
+    md = render_companion_delivery_markdown(composed)
+    assert isinstance(md, str)
+    assert "The Eiffel Tower is in Paris." in md  # the caller's own research output is shown
+    assert "Verified by Proov" in md  # the rendered badge is embedded on the caller's delivery
+    assert "basescan.org/tx/0xabc123" in md  # tx-bearing → BaseScan proof link
+
+
+def test_render_companion_delivery_in_band_is_honest_preview():
+    deliverable = _real_deliverable()
+    artifact = extract_verified_artifact(deliverable)  # in-band, anchor=None
+    composed = compose_delivery(research_output="x", verified_artifact=artifact, proov_order_id="o")
+    md = render_companion_delivery_markdown(composed)
+    assert "not anchored" in md.lower()  # AC3 honest about the missing anchor
+    assert "basescan.org" not in md  # no fabricated proof link
+
+
+def test_render_companion_delivery_degrades_on_unverified():
+    composed = compose_delivery(
+        research_output="some-research-text", verified_artifact=None, proov_order_id=None
+    )
+    md = render_companion_delivery_markdown(composed)
+    assert isinstance(md, str)
+    assert "unverified" in md.lower()  # honest degrade, never the affirmative form
+    assert "some-research-text" in md
+
+
+def test_render_does_not_mutate_or_change_compose_delivery_json_shape():
+    # AC6: rendering is ADDITIVE — compose_delivery's JSON contract is untouched by the render step.
+    deliverable = _real_deliverable()
+    artifact = extract_verified_artifact(deliverable, content_hash="0xc", deliver_tx_hash="0xabc")
+    composed = compose_delivery(research_output="x", verified_artifact=artifact, proov_order_id="o")
+    assert set(composed.keys()) == {
+        "agent",
+        "research_output",
+        "verified",
+        "verdict",
+        "confidence",
+        "verified_by_proov",
+        "proov_order",
+    }
+    before = json.dumps(composed, sort_keys=True)
+    render_companion_delivery_markdown(composed)
+    assert json.dumps(composed, sort_keys=True) == before  # render must not mutate the delivery

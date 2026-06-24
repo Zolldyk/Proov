@@ -178,3 +178,29 @@ def test_render_result_renders_structured_error_cleanly():
     html_str = render_result({"error_code": "empty_output_field", "reason": "x: blank"})
     assert "empty_output_field" in html_str
     assert "&larr; Back" in html_str or "Back" in html_str
+
+
+# --- Story 4.3 AC5/AC7: the result page renders the actual badge (preview form) + new copy -----
+
+
+def test_render_result_renders_the_verified_badge_preview():
+    deliverable = run_demo_verification("Paris is the capital of France.", "", "quick")
+    html_str = render_result(deliverable)
+    # AC5: the actual rendered badge element is present (the in-band / preview form).
+    assert "proov-badge" in html_str
+    # AC3: the off-protocol preview is honest — says preview, shows NO BaseScan tx link.
+    assert "not anchored on-chain" in html_str
+    assert "basescan.org/tx" not in html_str
+
+
+def test_render_result_trial_friction_copy_replaces_stale_later_story():
+    html_str = render_result(run_demo_verification("A factual sentence.", "", "quick"))
+    # AC5/AC7: the stale "later story" sentence is gone; the free→$0.10 conversion path is stated.
+    assert "later story" not in html_str
+    assert "$0.10" in html_str
+
+
+def test_render_form_no_longer_promises_badge_as_a_later_story():
+    # The free-preview notice is shared by the form page too — keep it consistent.
+    assert "later story" not in render_form()
+    assert "$0.10" in render_form()

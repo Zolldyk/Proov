@@ -6,13 +6,18 @@ pure-math unit style of `tests/test_calibration.py`.
 
 from __future__ import annotations
 
+from dataclasses import replace as dataclasses_replace
+
 from proov.metrics import (
+    AdoptionGoals,
+    AdoptionScore,
     MetricsReport,
     OrderRecord,
     compute_metrics,
     estimate_claim_cost,
     estimate_order_cost,
     resolve_own_agent_ids,
+    score_adoption,
 )
 
 # --------------------------------------------------------------------------- helpers
@@ -257,3 +262,124 @@ def test_resolve_own_agent_ids_none_and_empty():
 def test_resolve_own_agent_ids_reads_env(monkeypatch):
     monkeypatch.setenv("PROOV_OWN_AGENT_IDS", "companion-1, companion-2")
     assert resolve_own_agent_ids() == frozenset({"companion-1", "companion-2"})
+
+
+# --------------------------------------------------------------------------- unique_external_counterparties (4.4)
+
+
+def test_unique_external_counterparties_excludes_own_ids():
+    # 3 distinct external agents + 1 companion (own) agent placing 2 orders.
+    own = frozenset({"companion-1"})
+    orders = [
+        _order("o1", requester_agent_id="ext-a", requester_wallet_address="0xa"),
+        _order("o2", requester_agent_id="ext-b", requester_wallet_address="0xb"),
+        _order("o3", requester_agent_id="ext-c", requester_wallet_address="0xc"),
+        _order("o4", requester_agent_id="companion-1", requester_wallet_address="0xself"),
+        _order("o5", requester_agent_id="companion-1", requester_wallet_address="0xself"),
+    ]
+    report = compute_metrics(orders, own_agent_ids=own)
+    # all-inclusive count sees the companion; the external count does not.
+    assert report.unique_counterparties == 4
+    assert report.unique_external_counterparties == 3
+    assert report.self_trade_orders == 2
+
+
+def test_unique_external_counterparties_is_zero_when_only_self():
+    own = frozenset({"companion-1"})
+    orders = [_order("o1", requester_agent_id="companion-1")]
+    report = compute_metrics(orders, own_agent_ids=own)
+    assert report.unique_external_counterparties == 0
+
+
+# --------------------------------------------------------------------------- score_adoption (4.4)
+
+
+def _passing_report() -> MetricsReport:
+    """A report that clears all four 4.4 goals (10 completed, 5 ext wallets, 3 ext counterparties,
+    external-dominant)."""
+    return MetricsReport(
+        total_orders=12,
+        completed_orders=10,
+        completion_rate=1.0,
+        unique_buyer_wallets=6,
+        unique_external_buyer_wallets=5,
+        unique_counterparties=4,
+        unique_external_counterparties=3,
+        self_trade_orders=2,  # 2/12 ≈ 0.167 < 0.5 → external-dominant
+        self_trade_ratio=2 / 12,
+        total_cost_usd=0.0,
+        cost_per_order=0.0,
+        total_revenue_usd=1.2,
+    )
+
+
+def test_score_adoption_passes_when_all_goals_clear():
+    score = score_adoption(_passing_report())
+    assert isinstance(score, AdoptionScore)
+    assert score.completed_met
+    assert score.external_wallets_met
+    assert score.external_counterparties_met
+    assert score.external_dominant_met
+    assert score.met is True
+
+
+def test_score_adoption_fails_when_completed_short():
+    report = dataclasses_replace(_passing_report(), completed_orders=9)
+    score = score_adoption(report)
+    assert score.completed_met is False
+    assert score.met is False
+
+
+def test_score_adoption_fails_when_external_wallets_short():
+    report = dataclasses_replace(_passing_report(), unique_external_buyer_wallets=4)
+    score = score_adoption(report)
+    assert score.external_wallets_met is False
+    assert score.met is False
+
+
+def test_score_adoption_fails_when_external_counterparties_short():
+    report = dataclasses_replace(_passing_report(), unique_external_counterparties=2)
+    score = score_adoption(report)
+    assert score.external_counterparties_met is False
+    assert score.met is False
+
+
+def test_score_adoption_fails_external_dominant_while_raw_counts_clear():
+    # The anti-self-trade case: 10 completed / 5 wallets / 3 counterparties all clear, but
+    # half-or-more of the orders are self-trade → external-dominant FAILS → overall FAIL.
+    report = dataclasses_replace(
+        _passing_report(), self_trade_orders=6, self_trade_ratio=6 / 12
+    )
+    score = score_adoption(report)
+    assert score.completed_met
+    assert score.external_wallets_met
+    assert score.external_counterparties_met
+    assert score.external_dominant_met is False  # 0.5 is NOT < 0.5
+    assert score.met is False
+
+
+def test_score_adoption_empty_ledger_is_fail_not_misleading_pass():
+    report = compute_metrics([], own_agent_ids=_NO_OWN)
+    score = score_adoption(report)
+    assert score.completed_met is False
+    assert score.external_wallets_met is False
+    assert score.external_counterparties_met is False
+    # self_trade_ratio is None on an empty ledger → external-dominant is NOT met.
+    assert score.external_dominant_met is False
+    assert score.met is False
+
+
+def test_score_adoption_honours_custom_goals():
+    # A stricter companion-minority bar: max_self_trade_ratio=0.2 fails a 0.167-ratio report? No,
+    # 0.167 < 0.2 still passes; tighten further to prove the override bites.
+    report = _passing_report()  # ratio ≈ 0.167
+    strict = AdoptionGoals(max_self_trade_ratio=0.1)
+    assert score_adoption(report, strict).external_dominant_met is False
+    lenient = AdoptionGoals(min_completed=5, min_external_counterparties=1)
+    assert score_adoption(dataclasses_replace(report, completed_orders=5), lenient).met is True
+
+
+def test_adoption_goals_defaults_encode_the_epic_bar():
+    g = AdoptionGoals()
+    assert (g.min_completed, g.min_external_wallets, g.min_external_counterparties) == (10, 5, 3)
+    assert g.max_self_trade_ratio == 0.5

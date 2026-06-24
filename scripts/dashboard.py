@@ -38,19 +38,24 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from proov.ledger import get_order_ledger  # noqa: E402
 from proov.metrics import (  # noqa: E402
+    AdoptionGoals,
+    AdoptionScore,
     MetricsReport,
     OrderRecord,
     compute_metrics,
     resolve_own_agent_ids,
+    score_adoption,
 )
 
 log = logging.getLogger("dashboard")
 
-# PRD §1 success targets (the "must-hit" bar the demo/README report against).
-_TARGET_ORDERS = 10
-_TARGET_EXTERNAL_WALLETS = 5
-_TARGET_COUNTERPARTIES = 3
-_TARGET_COMPLETION_RATE = 0.95
+# PRD §1 / Story 4.4 success targets — the SINGLE source of truth is `AdoptionGoals` (the pure
+# scorer's bar), so the dashboard markers and the adoption verdict can never silently drift.
+_GOALS = AdoptionGoals()
+_TARGET_ORDERS = _GOALS.min_completed
+_TARGET_EXTERNAL_WALLETS = _GOALS.min_external_wallets
+_TARGET_COUNTERPARTIES = _GOALS.min_external_counterparties
+_TARGET_COMPLETION_RATE = 0.95  # not part of the 4.4 adoption bar — dashboard-only.
 
 
 def _pct(value: float | None) -> str:
@@ -92,9 +97,10 @@ def render_dashboard(report: MetricsReport) -> str:
         f"    of which external   : {report.unique_external_buyer_wallets:<10d} >= "
         f"{_TARGET_EXTERNAL_WALLETS:<5d} "
         f"{_mark(report.unique_external_buyer_wallets, _TARGET_EXTERNAL_WALLETS)}",
-        f"  unique counterparties : {report.unique_counterparties:<10d} >= "
+        f"  unique counterparties : {report.unique_counterparties:<10d}",
+        f"    of which external   : {report.unique_external_counterparties:<10d} >= "
         f"{_TARGET_COUNTERPARTIES:<5d} "
-        f"{_mark(report.unique_counterparties, _TARGET_COUNTERPARTIES)}",
+        f"{_mark(report.unique_external_counterparties, _TARGET_COUNTERPARTIES)}",
         "",
         "Counter-metrics (guard the guardrails — PRD §1: don't win wrong)",
         f"  self-trade ratio      : {_pct(report.self_trade_ratio):<10} "
@@ -104,6 +110,42 @@ def render_dashboard(report: MetricsReport) -> str:
         "(must stay ~$0 marginal — NFR1)",
         f"  revenue               : {_usd(report.total_revenue_usd)}",
         f"  margin (rev - cost)   : {_usd(margin)}",
+    ]
+    return "\n".join(lines)
+
+
+def _goal_mark(met: bool) -> str:
+    """A ✓ / ✗ for a single adoption goal's met / not-met boolean."""
+    return "✓" if met else "✗"
+
+
+def render_adoption(
+    score: AdoptionScore, report: MetricsReport, goals: AdoptionGoals
+) -> str:
+    """Format the Story 4.4 adoption scorecard — per-goal ✓/✗ + the single PASS/FAIL verdict.
+
+    Pure string formatting (no I/O), the twin of `render_dashboard`. Each goal shows its actual
+    vs target with a ✓ (met) / ✗ (not met) mark from the pure `AdoptionScore`; the external-
+    dominant row shows the self-trade ratio (`n/a` when undefined → ✗). The final
+    `ADOPTION GOAL: PASS|FAIL` line is the single "external-dominant adoption goal met" verdict a
+    judge (and the operator) reads — FAIL on an empty / self-dominated ledger, never a misleading
+    pass.
+    """
+    lines = [
+        "",
+        "Adoption goal (Story 4.4 — external-dominant order bar)",
+        "-" * 48,
+        f"  completed orders       : {report.completed_orders:<10d} >= "
+        f"{goals.min_completed:<5d} {_goal_mark(score.completed_met)}",
+        f"  external buyer wallets : {report.unique_external_buyer_wallets:<10d} >= "
+        f"{goals.min_external_wallets:<5d} {_goal_mark(score.external_wallets_met)}",
+        f"  external counterparties: {report.unique_external_counterparties:<10d} >= "
+        f"{goals.min_external_counterparties:<5d} {_goal_mark(score.external_counterparties_met)}",
+        f"  external-dominant      : self-trade {_pct(report.self_trade_ratio):<8} <  "
+        f"{_pct(goals.max_self_trade_ratio):<6} {_goal_mark(score.external_dominant_met)}",
+        "",
+        f"  ADOPTION GOAL: {'PASS' if score.met else 'FAIL'}"
+        "   (external orders must dominate — self-trading is not a win)",
     ]
     return "\n".join(lines)
 
@@ -118,7 +160,9 @@ def _run_offline() -> int:
         return compute_metrics(records, own_agent_ids=own)
 
     report = asyncio.run(_go())
+    score = score_adoption(report, _GOALS)
     print(render_dashboard(report))
+    print(render_adoption(score, report, _GOALS))
     return 0
 
 
@@ -210,7 +254,9 @@ def _run_live() -> int:
             await client.close()
 
     report = asyncio.run(_go())
+    score = score_adoption(report, _GOALS)
     print(render_dashboard(report))
+    print(render_adoption(score, report, _GOALS))
     return 0
 
 

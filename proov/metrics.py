@@ -68,10 +68,17 @@ class MetricsReport:
     """The computed success + counter-metric result vocabulary (frozen, like `Verdict`).
 
     Success metrics: `total_orders`, `completed_orders`, `completion_rate`,
-    `unique_buyer_wallets`, `unique_external_buyer_wallets`, `unique_counterparties`.
+    `unique_buyer_wallets`, `unique_external_buyer_wallets`, `unique_counterparties`,
+    `unique_external_counterparties`.
     Counter-metrics: `self_trade_orders` / `self_trade_ratio`, `total_cost_usd` / `cost_per_order`.
     `total_revenue_usd` is reported so the operator sees margin = revenue − cost. Every ratio is
     `float | None` — `None` when its denominator is 0 (undefined, never a misleading `0.0`).
+
+    `unique_external_counterparties` (Story 4.4) is the distinct-counterparty count EXCLUDING the
+    self/companion agent ids — the honest twin of `unique_external_buyer_wallets`. The all-inclusive
+    `unique_counterparties` includes the companion (Story 4.2), so the adoption bar's "≥3 unique
+    counterparty *agents*, external-dominant" must score on the external subset (a single
+    self/companion agent could otherwise inflate the count — the anti-self-trade point of 4.4).
     """
 
     total_orders: int
@@ -80,6 +87,7 @@ class MetricsReport:
     unique_buyer_wallets: int
     unique_external_buyer_wallets: int
     unique_counterparties: int
+    unique_external_counterparties: int
     self_trade_orders: int
     self_trade_ratio: float | None
     total_cost_usd: float
@@ -109,7 +117,8 @@ def compute_metrics(
       `None` if `terminal_orders == 0` (in-flight orders are excluded from the denominator).
     - `unique_buyer_wallets` = distinct non-empty `requester_wallet_address`;
       `unique_external_buyer_wallets` = same, excluding rows whose `requester_agent_id` is in
-      `own_agent_ids`; `unique_counterparties` = distinct non-empty `requester_agent_id`.
+      `own_agent_ids`; `unique_counterparties` = distinct non-empty `requester_agent_id`;
+      `unique_external_counterparties` = same, excluding `requester_agent_id` in `own_agent_ids`.
     - `self_trade_ratio` = `self_trade_orders / total_orders` (own-agent rows / all),
       `None` if `total_orders == 0`.
     - `cost_per_order` = `total_cost_usd / total_orders` (`total_cost_usd` sums non-`None`
@@ -127,6 +136,7 @@ def compute_metrics(
     buyer_wallets: set[str] = set()
     external_buyer_wallets: set[str] = set()
     counterparties: set[str] = set()
+    external_counterparties: set[str] = set()
 
     for o in orders:
         if o.status == "completed":
@@ -146,6 +156,8 @@ def compute_metrics(
         agent = o.requester_agent_id
         if agent:
             counterparties.add(agent)
+            if not is_self:
+                external_counterparties.add(agent)
 
         if o.cost_usd is not None:
             total_cost_usd += o.cost_usd
@@ -159,11 +171,84 @@ def compute_metrics(
         unique_buyer_wallets=len(buyer_wallets),
         unique_external_buyer_wallets=len(external_buyer_wallets),
         unique_counterparties=len(counterparties),
+        unique_external_counterparties=len(external_counterparties),
         self_trade_orders=self_trade_orders,
         self_trade_ratio=_ratio(self_trade_orders, total_orders),
         total_cost_usd=total_cost_usd,
         cost_per_order=_ratio(total_cost_usd, total_orders),
         total_revenue_usd=total_revenue_usd,
+    )
+
+
+@dataclass(frozen=True)
+class AdoptionGoals:
+    """The exact Story 4.4 reward bar as overridable thresholds (frozen value object).
+
+    Defaults encode the epic AC verbatim: ≥10 completed orders, ≥5 unique EXTERNAL buyer
+    wallets, ≥3 unique EXTERNAL counterparties, and **external-dominant** (`self_trade_ratio <
+    0.5` — strictly more external than self orders). `max_self_trade_ratio` is a strict upper
+    bound on the self-trade share; lower it (e.g. `0.2`) to demand the companion stay a small
+    minority. Pure data — `score_adoption` reads these, never the env.
+    """
+
+    min_completed: int = 10
+    min_external_wallets: int = 5
+    min_external_counterparties: int = 3
+    max_self_trade_ratio: float = 0.5
+
+
+@dataclass(frozen=True)
+class AdoptionScore:
+    """The per-goal + overall PASS/FAIL result of scoring a `MetricsReport` against the bar.
+
+    Each `*_met` flag is the individual goal's verdict; `met` is `all(...)` of them — a single
+    unambiguous "adoption goal met" boolean the dashboard/judge reads. An empty or
+    self-dominated ledger yields `external_dominant_met=False` (a `None` `self_trade_ratio` is
+    NOT met — undefined is never a misleading pass), so the overall verdict is honestly FAIL.
+    """
+
+    completed_met: bool
+    external_wallets_met: bool
+    external_counterparties_met: bool
+    external_dominant_met: bool
+    met: bool
+
+
+def score_adoption(
+    report: MetricsReport, goals: AdoptionGoals = AdoptionGoals()
+) -> AdoptionScore:
+    """Score a `MetricsReport` against the 4.4 adoption bar → `AdoptionScore` — PURE (AC1/AC3).
+
+    Each count goal is a `>=` against the report's EXTERNAL metrics (wallets/counterparties
+    exclude self/companion ids, AC2). External-dominant is `self_trade_ratio is not None and
+    self_trade_ratio < goals.max_self_trade_ratio`: a `None` ratio — an empty ledger — is **not
+    met** (mirrors `_ratio`'s undefined-on-zero discipline; an empty ledger is FAIL, never a
+    misleading pass, AC3), and clearing the raw counts by self-trading (`ratio >= 0.5`) is still
+    a FAIL. Overall `met = all` per-goal flags. No I/O, no clock, no randomness, no env read —
+    same inputs ⇒ same result on CPython.
+    """
+    completed_met = report.completed_orders >= goals.min_completed
+    external_wallets_met = (
+        report.unique_external_buyer_wallets >= goals.min_external_wallets
+    )
+    external_counterparties_met = (
+        report.unique_external_counterparties >= goals.min_external_counterparties
+    )
+    external_dominant_met = (
+        report.self_trade_ratio is not None
+        and report.self_trade_ratio < goals.max_self_trade_ratio
+    )
+    return AdoptionScore(
+        completed_met=completed_met,
+        external_wallets_met=external_wallets_met,
+        external_counterparties_met=external_counterparties_met,
+        external_dominant_met=external_dominant_met,
+        met=(
+            completed_met
+            and external_wallets_met
+            and external_counterparties_met
+            and external_dominant_met
+        ),
     )
 
 

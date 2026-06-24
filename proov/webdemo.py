@@ -3,7 +3,9 @@
 The first user-facing surface Proov ships. It runs the **identical** verification pipeline a
 paid CAP order runs in `proov/provider.py` — `validate_requirements` → `engine.verify` →
 `build_deliverable` — but **off-protocol**: no payment, no WebSocket, no `deliver_order`, no
-on-chain anchor (FR19's free preview; the paid on-chain order + rendered badge is Story 4.3).
+on-chain anchor (FR19's free preview). The result page renders the "Verified by Proov" badge in
+its honest **un-anchored preview** form (Story 4.3); the paid on-chain, tx-bearing badge comes
+from a real $0.10 Quick Check order on-protocol.
 It re-implements NONE of the verdict/extraction/judgment/deliverable logic — it only
 orchestrates the existing entrypoints, mirroring `provider._handle_order_paid`'s verify→build
 block (`proov/provider.py:431-497`) and its degrade-don't-drop discipline.
@@ -28,6 +30,7 @@ from typing import Any
 
 from proov import deliverable as _deliverable
 from proov import engine as _engine
+from proov.badge import render_badge_html
 from proov.validation import validate_requirements
 
 log = logging.getLogger("proov.webdemo")
@@ -125,8 +128,11 @@ _FREE_PREVIEW_NOTICE = (
     "This is a <strong>free, off-protocol preview</strong>: no CAP order is placed, no payment "
     "is made, and the receipt below is computed but <strong>NOT anchored on-chain</strong> "
     "(<code>verified_by_proov.anchor</code> is <code>null</code>). It runs the exact same "
-    "verification pipeline a paid order runs. The paid on-chain order and rendered "
-    "&ldquo;Verified by Proov&rdquo; badge are a later story."
+    "verification pipeline a paid order runs, and the &ldquo;Verified by Proov&rdquo; badge below "
+    "renders in its <strong>un-anchored preview</strong> form. To get the "
+    "<strong>on-chain-anchored</strong>, tx-bearing badge for your own delivery, place a real "
+    "<strong>$0.10 Quick Check order</strong> on-protocol (the floor price &mdash; see the README "
+    "&ldquo;Place a test order&rdquo; / companion section)."
 )
 
 _KEYLESS_NOTICE = (
@@ -266,6 +272,13 @@ def render_result(deliverable_or_error: dict) -> str:
 
     receipt = d.get("receipt") or {}
     badge = d.get("verified_by_proov") or {}
+
+    # Story 4.3 AC5: render the ACTUAL "Verified by Proov" badge (the in-band/preview form the
+    # off-protocol demo carries, `anchor=null`). `render_badge_html` is honest per AC2/AC3 (says
+    # "preview — not anchored on-chain", no fabricated tx link) and html-escapes every value.
+    parts.append("<h2>Verified by Proov</h2>")
+    parts.append(render_badge_html(badge))
+
     report_hash = html.escape(str(receipt.get("report_hash", "")))
     receipt_id = html.escape(str(badge.get("receipt_id", "")))
     anchor = badge.get("anchor")

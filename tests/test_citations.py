@@ -25,9 +25,11 @@ from proov.citations import (
     _classify_retrievability,
     _fetch_source,
     _flag_for,
+    _is_blocked_address,
     _resolve_max_sources,
     _resolve_timeout,
     _resolve_user_agent,
+    _ssrf_block_reason,
     _strip_html,
     check_citations,
 )
@@ -41,6 +43,17 @@ def _clear_citation_env(monkeypatch):
     monkeypatch.delenv("PROOV_CITATION_TIMEOUT", raising=False)
     monkeypatch.delenv("PROOV_CITATION_USER_AGENT", raising=False)
     monkeypatch.delenv("PROOV_LLM_PROVIDER", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _stub_resolver(monkeypatch):
+    """Pin the SSRF guard's DNS seam to a PUBLIC IP for all hosts — no real socket (Story 4.4).
+
+    Every fetch test passes a public-looking host (`example.com`, `a`, `big.example`); without
+    this they would do a real `getaddrinfo`. Stubbing `_resolve_host` to a single public address
+    keeps them offline AND unblocked by the new guard. SSRF tests override this per-test to return
+    an internal address (or assert host classification directly)."""
+    monkeypatch.setattr(cit, "_resolve_host", lambda host: ["93.184.216.34"])
 
 
 # --------------------------------------------------------------------------- helpers
@@ -834,3 +847,158 @@ async def test_max_paid_sources_does_not_limit_deep_discovered(monkeypatch, capl
     assert len(provided_results) == 1  # provided truncated to the affordable budget (1 paid source)
     assert len(discovered_results) == 2  # discovered untouched by the budget cap
     assert any("cost ceiling" in r.message for r in caplog.records)  # one budget-cap warning
+
+
+# --------------------------------------------------------------------------- SSRF guard (Story 4.4)
+
+
+@pytest.mark.parametrize(
+    "ip",
+    [
+        "127.0.0.1",  # loopback
+        "10.0.0.5",  # RFC-1918
+        "172.16.0.1",  # RFC-1918
+        "192.168.1.1",  # RFC-1918
+        "169.254.169.254",  # cloud metadata (link-local)
+        "::1",  # IPv6 loopback
+        "::ffff:127.0.0.1",  # IPv4-mapped loopback
+        "0.0.0.0",  # unspecified
+        "fe80::1",  # IPv6 link-local
+        "not-an-ip",  # unparseable → blocked conservatively
+    ],
+)
+def test_is_blocked_address_blocks_internal_and_metadata(ip):
+    assert _is_blocked_address(ip) is True
+
+
+@pytest.mark.parametrize("ip", ["93.184.216.34", "8.8.8.8", "2606:2800:220:1:248:1893:25c8:1946"])
+def test_is_blocked_address_allows_public(ip):
+    assert _is_blocked_address(ip) is False
+
+
+def test_ssrf_block_reason_rejects_non_http_scheme(monkeypatch):
+    # A non-http(s) scheme is refused before any DNS resolution.
+    monkeypatch.setattr(cit, "_resolve_host", lambda host: ["93.184.216.34"])
+    assert _ssrf_block_reason("file:///etc/passwd") is not None
+    assert _ssrf_block_reason("gopher://example.com/") is not None
+    assert _ssrf_block_reason("ftp://example.com/") is not None
+
+
+def test_ssrf_block_reason_blocks_host_resolving_internal(monkeypatch):
+    monkeypatch.setattr(cit, "_resolve_host", lambda host: ["127.0.0.1"])
+    assert _ssrf_block_reason("http://localhost/") is not None
+
+
+def test_ssrf_block_reason_blocks_when_any_record_internal(monkeypatch):
+    # DNS-rebinding defence: a host with even ONE internal record is refused.
+    monkeypatch.setattr(cit, "_resolve_host", lambda host: ["93.184.216.34", "169.254.169.254"])
+    assert _ssrf_block_reason("http://rebind.example/") is not None
+
+
+def test_ssrf_block_reason_allows_public(monkeypatch):
+    monkeypatch.setattr(cit, "_resolve_host", lambda host: ["93.184.216.34"])
+    assert _ssrf_block_reason("https://example.com/page") is None
+
+
+def test_ssrf_block_reason_resolution_failure_is_not_a_block(monkeypatch):
+    # A host that won't resolve is NOT proof of an internal target → not blocked here (the real
+    # fetch surfaces it as the ambiguous transport outcome).
+    monkeypatch.setattr(cit, "_resolve_host", lambda host: [])
+    assert _ssrf_block_reason("http://nxdomain.invalid/") is None
+
+
+async def test_fetch_source_blocks_loopback_to_ambiguous(monkeypatch):
+    # A loopback target degrades to ambiguous, NEVER fabricated, with no socket call attempted.
+    monkeypatch.setattr(cit, "_resolve_host", lambda host: ["127.0.0.1"])
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - must not run
+        raise AssertionError("blocked URL must not be fetched")
+
+    async with _mock_fetch_client(handler) as client:
+        result = await _fetch_source("http://127.0.0.1/admin", client=client, timeout=1.0)
+    assert result == ("ambiguous", "")
+
+
+async def test_fetch_source_blocks_metadata_to_ambiguous(monkeypatch):
+    monkeypatch.setattr(cit, "_resolve_host", lambda host: ["169.254.169.254"])
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("metadata URL must not be fetched")
+
+    async with _mock_fetch_client(handler) as client:
+        result = await _fetch_source(
+            "http://169.254.169.254/latest/meta-data/", client=client, timeout=1.0
+        )
+    assert result == ("ambiguous", "")
+
+
+async def test_fetch_source_blocks_non_http_scheme_to_ambiguous(monkeypatch):
+    monkeypatch.setattr(cit, "_resolve_host", lambda host: ["93.184.216.34"])
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("non-http scheme must not be fetched")
+
+    async with _mock_fetch_client(handler) as client:
+        result = await _fetch_source("file:///etc/passwd", client=client, timeout=1.0)
+    assert result == ("ambiguous", "")
+
+
+async def test_fetch_source_blocks_redirect_to_internal(monkeypatch):
+    # The public entry URL is allowed, but it 302s to an internal host → blocked on the hop,
+    # never followed to the metadata service.
+    def resolver(host: str) -> list[str]:
+        return ["169.254.169.254"] if host == "evil.internal" else ["93.184.216.34"]
+
+    monkeypatch.setattr(cit, "_resolve_host", resolver)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "evil.internal":  # pragma: no cover - must not be reached
+            raise AssertionError("redirect to internal must not be fetched")
+        return httpx.Response(302, headers={"Location": "http://evil.internal/meta"})
+
+    async with _mock_fetch_client(handler) as client:
+        result = await _fetch_source(
+            "https://public.example/start", client=client, timeout=1.0
+        )
+    assert result == ("ambiguous", "")
+
+
+async def test_blocked_source_yields_ambiguous_ok_not_fabricated(monkeypatch):
+    # The honesty invariant: a blocked fetch flows through check_citations to a non-fabricating
+    # `ok` flag — refusing to reach a URL is NOT evidence it is fabricated.
+    monkeypatch.setattr(cit, "_resolve_host", lambda host: ["127.0.0.1"])
+    results = await check_citations(
+        "Some output.",
+        [{"url": "http://127.0.0.1/secret"}],
+        "quick",
+        provider=StubLLMProvider(),
+    )
+    assert len(results) == 1
+    assert results[0].flag == "ok"
+    assert results[0].flag != "fabricated"
+
+
+async def test_normal_public_url_still_fetches_retrievable(monkeypatch):
+    # The guard does not break the happy path: a public URL still fetches and judges.
+    monkeypatch.setattr(cit, "_resolve_host", lambda host: ["93.184.216.34"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=_html("Paris is the capital of France."))
+
+    async with _mock_fetch_client(handler) as client:
+        cls, text = await _fetch_source("https://example.com", client=client, timeout=1.0)
+    assert cls == "retrievable"
+    assert text == "Paris is the capital of France."
+
+
+async def test_fetch_source_redirect_without_location_is_ambiguous(monkeypatch):
+    # A 3xx with no/invalid Location (next_request is None) cannot be followed; it must degrade to
+    # the conservative `ambiguous`, not be classified `retrievable` because its status is < 400.
+    monkeypatch.setattr(cit, "_resolve_host", lambda host: ["93.184.216.34"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302)  # redirect status, but no Location header
+
+    async with _mock_fetch_client(handler) as client:
+        result = await _fetch_source("https://example.com/moved", client=client, timeout=1.0)
+    assert result == ("ambiguous", "")

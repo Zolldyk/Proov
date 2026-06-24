@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
@@ -40,6 +41,15 @@ _DEFAULT_PORT = 8080
 # the raw POST body read so a giant Content-Length cannot be buffered before the validator —
 # which also caps it — ever sees the string. Add headroom for form-encoding overhead.
 _DEFAULT_MAX_BYTES = 256 * 1024
+# Story 4.4 DoS hardening for the unauthenticated public surface:
+#   * a bounded number of concurrent verifications (mirrors `provider.py`'s `_verification_slot`):
+#     `ThreadingHTTPServer` spawns one thread per request, each running a blocking
+#     `asyncio.run(engine.verify(...))`, so an unbounded flood could exhaust CPU/memory. Over the
+#     cap, a POST gets a clean 503 instead of piling on another worker.
+#   * a socket read timeout so a slow / lying-`Content-Length` client cannot pin a worker thread
+#     indefinitely on `rfile.read`.
+_DEFAULT_MAX_CONCURRENCY = 4
+_DEFAULT_READ_TIMEOUT = 30.0
 
 
 def _env_int(name: str, default: int) -> int:
@@ -54,8 +64,30 @@ def _env_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _env_float(name: str, default: float) -> float:
+    """Read a positive finite float env var; fall back to `default` on missing/garbage/≤0/inf/nan."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if value != value or value in (float("inf"), float("-inf")) or value <= 0:
+        return default
+    return value
+
+
 def _max_body_bytes() -> int:
     return _env_int("PROOV_MAX_INPUT_BYTES", _DEFAULT_MAX_BYTES)
+
+
+def _max_concurrency() -> int:
+    return _env_int("PROOV_TRYTHIS_MAX_CONCURRENCY", _DEFAULT_MAX_CONCURRENCY)
+
+
+def _read_timeout() -> float:
+    return _env_float("PROOV_TRYTHIS_READ_TIMEOUT", _DEFAULT_READ_TIMEOUT)
 
 
 def _is_loopback(host: str) -> bool:
@@ -67,12 +99,33 @@ class _TryThisHandler(BaseHTTPRequestHandler):
     """Serve the GET form and run a POST verification — every response is `text/html`."""
 
     server_version = "ProovTryThis/0.1"
+    # Bounded-concurrency gate (Story 4.4). `None` → unbounded (the test/import default); `main()`
+    # installs a `threading.BoundedSemaphore(_max_concurrency())` before serving so the public
+    # surface caps in-flight verifications and sheds load with a 503 rather than spawning forever.
+    _slots: threading.BoundedSemaphore | None = None
+
+    def setup(self) -> None:
+        super().setup()
+        # Socket read timeout (Story 4.4): a slow / lying-`Content-Length` client cannot pin this
+        # worker thread on `rfile.read` indefinitely. A timeout surfaces as a handled error page.
+        try:
+            self.connection.settimeout(_read_timeout())
+        except OSError:  # pragma: no cover - defensive; a real socket always accepts this
+            pass
 
     def _send_html(self, status: int, body: str) -> None:
         encoded = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
+        # Defense-in-depth behind the primary `html.escape` control (Story 4.4): never let a
+        # browser sniff this declared text/html as something executable, and forbid every external
+        # / script / object resource. The page is inline-styled with a self-posting form and no JS.
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'",
+        )
         self.end_headers()
         self.wfile.write(encoded)
 
@@ -86,6 +139,17 @@ class _TryThisHandler(BaseHTTPRequestHandler):
             self._send_error_page()
 
     def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
+        # Bounded-concurrency gate: acquire a slot WITHOUT blocking. Over the cap, shed load with a
+        # clean 503 rather than piling another blocking `asyncio.run(verify)` onto a new thread.
+        slots = type(self)._slots
+        acquired = slots.acquire(blocking=False) if slots is not None else True
+        if not acquired:
+            self._send_html(
+                503,
+                "<h1>503</h1><p>The demo is busy right now. "
+                "Please <a href=\"/\">try again</a> in a moment.</p>",
+            )
+            return
         try:
             if self.path not in ("/", "/verify"):
                 self._send_html(404, "<h1>404</h1><p>Not found. Try <a href=\"/\">/</a>.</p>")
@@ -114,6 +178,9 @@ class _TryThisHandler(BaseHTTPRequestHandler):
             self._send_html(200, render_result(result))
         except Exception:  # run_demo_verification degrades internally; this guards render/IO faults
             self._send_error_page()
+        finally:
+            if slots is not None and acquired:
+                slots.release()
 
     def _send_error_page(self) -> None:
         """Last-resort clean error response so a handler fault never resets the connection."""
@@ -147,8 +214,15 @@ def main() -> int:
     )
     host = os.environ.get("PROOV_TRYTHIS_HOST", _DEFAULT_HOST)
     port = _env_int("PROOV_TRYTHIS_PORT", _DEFAULT_PORT)
+    # Install the bounded-concurrency gate before serving (Story 4.4): over the cap, POSTs get a
+    # 503 instead of spawning another unbounded blocking-verify worker thread.
+    _TryThisHandler._slots = threading.BoundedSemaphore(_max_concurrency())
     httpd = ThreadingHTTPServer((host, port), _TryThisHandler)
     print(f"Proov 'Try this' demo (free, off-protocol) serving at http://{host}:{port}")
+    print(
+        f"Concurrency cap: {_max_concurrency()} in-flight verifications "
+        f"(503 over cap); socket read timeout {_read_timeout()}s."
+    )
     print("This is a free preview — no CAP order, no payment, no on-chain anchor.")
     if not os.environ.get("GEMINI_API_KEY"):
         print("No GEMINI_API_KEY set: running $0 offline (stub + Wikipedia, optimistic).")

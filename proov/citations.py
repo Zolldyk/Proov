@@ -33,10 +33,12 @@ reusing the stance the judge already assigned (no re-fetch, no re-judge), passed
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import math
 import os
 import re
+import socket
 from typing import Literal
 
 import httpx
@@ -58,6 +60,12 @@ _MAX_FETCH_BYTES = 1_000_000
 _MAX_CLAIM_CHARS = 2000
 # Per-source fetch timeout default; an infinite timeout would defeat the SLA (NFR2).
 _DEFAULT_CITATION_TIMEOUT = 10.0
+# Story 4.4 SSRF guard: bound manual redirect following so a redirect loop cannot spin forever.
+# A chain longer than this is refused (→ the non-fabricating `ambiguous` outcome).
+_MAX_REDIRECTS = 5
+# The cloud instance-metadata address (AWS/GCP/Azure all answer here). Already link-local, but
+# rejected explicitly so the intent is unmistakable in the guard.
+_CLOUD_METADATA_IP = "169.254.169.254"
 # Story 3.4: cap the number of buyer-PROVIDED sources fetched+judged, closing the deferred-2.4
 # paid-call amplification hole (a giant `sources` array → unbounded paid judge calls/fetches).
 # Default 50 — generous vs typical buyer use + the 20/50 claim caps, still bounds spend.
@@ -169,22 +177,138 @@ def _strip_html(text: str) -> str:
     return _WHITESPACE_RE.sub(" ", _HTML_TAG_RE.sub("", text)).strip()
 
 
+def _resolve_host(host: str) -> list[str]:
+    """Resolve `host` to its IP address strings via `socket.getaddrinfo` — the monkeypatchable seam.
+
+    The ONE DNS touchpoint of the SSRF guard (tests monkeypatch THIS, never a real socket). A
+    resolution failure (DNS error / bad host) returns `[]` — NOT a block: a host that won't
+    resolve degrades to the existing `ambiguous` transport outcome via the real fetch, it is not
+    "proof" of an internal target. Returns every resolved address so a multi-record host with even
+    one internal A/AAAA record is caught by the caller (a DNS-rebinding defence).
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, OSError):
+        return []
+    return [info[4][0] for info in infos]
+
+
+def _is_blocked_address(ip: str) -> bool:
+    """True if `ip` is a private/loopback/link-local/reserved/metadata target (SSRF, AC7) — PURE.
+
+    Stdlib `ipaddress` classification, no I/O. An IPv4-mapped IPv6 address (`::ffff:127.0.0.1`)
+    is unwrapped first so the wrapper cannot smuggle an internal v4 target past the v4 checks. The
+    cloud-metadata `169.254.169.254` is already link-local but is also rejected explicitly. An
+    unparseable address string is blocked conservatively (we could not prove it safe).
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+        or str(addr) == _CLOUD_METADATA_IP
+    )
+
+
+def _ssrf_block_reason(url: str) -> str | None:
+    """Return a reason string if `url` must be REFUSED by the SSRF guard (AC7), else `None`.
+
+    Two gates: (1) the scheme must be `http`/`https` — `file://`, `gopher://`, `ftp://` etc. are
+    refused outright; (2) the host is resolved (`_resolve_host`) and refused if ANY resolved IP is
+    private/loopback/link-local/reserved/metadata (`_is_blocked_address`). A resolution failure is
+    NOT a block (it falls through to the real fetch → `ambiguous`). PURE except the DNS seam — same
+    url ⇒ same decision for a fixed resolver. This is called on the INITIAL url AND on every
+    redirect `Location`, so a 302-to-internal / DNS-rebinding cannot bypass a one-shot check.
+    """
+    try:
+        parsed = httpx.URL(url)
+    except (httpx.InvalidURL, TypeError, ValueError):
+        return "unparseable url"
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        return f"non-http(s) scheme {scheme!r}"
+    host = parsed.host
+    if not host:
+        return "missing host"
+    for ip in _resolve_host(host):
+        if _is_blocked_address(ip):
+            return f"host {host!r} resolves to blocked address {ip}"
+    return None
+
+
+async def _get_guarded(
+    client: httpx.AsyncClient, url: str, headers: dict[str, str]
+) -> httpx.Response | None:
+    """GET `url`, following redirects MANUALLY with an SSRF re-check on EVERY hop (AC7).
+
+    Returns the final non-redirect `httpx.Response`, or `None` when the initial url or any redirect
+    target is refused by `_ssrf_block_reason` (or the chain exceeds `_MAX_REDIRECTS`) — the caller
+    degrades a `None` to the conservative `ambiguous` (a blocked fetch can NOT prove a citation
+    fabricated). Redirects are followed by hand (`follow_redirects=False` + `response.next_request`)
+    precisely so a 302-to-internal is caught — `follow_redirects=True` would chase it before any
+    re-check. Transport errors (`httpx.HTTPError`) propagate to the caller's handler.
+    """
+    reason = _ssrf_block_reason(url)
+    if reason:
+        logger.warning("citation fetch blocked (SSRF guard) for %s: %s", url, reason)
+        return None
+    response = await client.get(url, headers=headers, follow_redirects=False)
+    hops = 0
+    while response.is_redirect and response.next_request is not None:
+        next_req = response.next_request
+        next_url = str(next_req.url)
+        hops += 1
+        await response.aclose()
+        # Bail on an over-long chain BEFORE resolving the next hop, so a too-deep redirect cannot
+        # provoke a DNS lookup of an attacker-controlled `Location` host we are about to refuse.
+        if hops > _MAX_REDIRECTS:
+            logger.warning(
+                "citation fetch for %s exceeded %d redirects → blocked", url, _MAX_REDIRECTS
+            )
+            return None
+        reason = _ssrf_block_reason(next_url)
+        if reason:
+            logger.warning(
+                "citation redirect blocked (SSRF guard) %s → %s: %s", url, next_url, reason
+            )
+            return None
+        response = await client.send(next_req, follow_redirects=False)
+    if response.is_redirect:
+        # A 3xx we could not follow (no / invalid `Location` → `next_request is None`) is not a
+        # retrievable source. Close it and degrade to the conservative `ambiguous` rather than
+        # letting `_classify_retrievability` map a bare 3xx (`status < 400`) to `retrievable`.
+        await response.aclose()
+        return None
+    return response
+
+
 async def _fetch_source(
     url: str,
     *,
     client: httpx.AsyncClient | None = None,
     timeout: float,
 ) -> tuple[Retrievability, str]:
-    """Retrievability probe: one async GET, NEVER raises out → `(Retrievability, cleaned_text)`.
+    """Retrievability probe: one SSRF-guarded GET, NEVER raises out → `(Retrievability, cleaned_text)`.
 
-    Issues a single async `httpx` GET with `follow_redirects=True` and a browser-like
-    `User-Agent` (Story 3.1). The response status / transport outcome is classified three ways
-    via `_classify_retrievability`: a `retrievable` (status < 400) response →
-    `("retrievable", _strip_html(text)[:_MAX_FETCH_CHARS])`; an `absent` (404/410) or any
-    `ambiguous` (other 4xx/5xx) response → `(cls, "")`; an `httpx.HTTPError` (transport / DNS /
-    timeout) → `("ambiguous", "")` with a logged warning — a transport failure can NOT prove a
-    source fabricated. We do NOT call `raise_for_status()` — we must *distinguish* the classes,
-    not raise on a 404.
+    Issues an async `httpx` GET behind the Story 4.4 SSRF guard (`_get_guarded`): the url and
+    every redirect `Location` are screened (`_ssrf_block_reason`) and redirects are followed
+    MANUALLY so a 302-to-internal / DNS-rebinding cannot reach a private/loopback/link-local/
+    cloud-metadata target. A blocked url → `("ambiguous", "")` (a refused fetch can NOT prove a
+    source fabricated — never a false `fabricated`, never raises). A browser-like `User-Agent`
+    rides every hop (Story 3.1). The (final) response status / transport outcome is classified
+    three ways via `_classify_retrievability`: `retrievable` (status < 400) →
+    `("retrievable", _strip_html(text)[:_MAX_FETCH_CHARS])`; `absent` (404/410) or any `ambiguous`
+    (other 4xx/5xx) → `(cls, "")`; an `httpx.HTTPError` (transport / DNS / timeout) →
+    `("ambiguous", "")` with a logged warning. We do NOT call `raise_for_status()` — we must
+    *distinguish* the classes, not raise on a 404.
 
     The `httpx.AsyncClient` is injectable so tests drive it via `httpx.MockTransport` with no
     real socket; when `None`, a client is opened with the resolved per-fetch timeout. The UA
@@ -195,18 +319,19 @@ async def _fetch_source(
     headers = {"User-Agent": _resolve_user_agent()}
     try:
         if client is None:
-            async with httpx.AsyncClient(
-                timeout=timeout, follow_redirects=True
-            ) as owned:
-                response = await owned.get(url, headers=headers)
+            async with httpx.AsyncClient(timeout=timeout) as owned:
+                response = await _get_guarded(owned, url, headers)
         else:
-            # The injected client (test MockTransport) carries its own behaviour; still ask
-            # for redirect-following so a 3xx chain resolves like the owned-client path.
-            response = await client.get(url, follow_redirects=True, headers=headers)
+            response = await _get_guarded(client, url, headers)
     except httpx.HTTPError as exc:
         # Transport / DNS / timeout — ambiguous (we reached no verdict on existence), not an
         # exception out, and NOT proof of fabrication.
         logger.warning("citation fetch failed for %s: %r", url, exc)
+        return ("ambiguous", "")
+
+    if response is None:
+        # The SSRF guard refused the url or a redirect hop (or the chain was too long). A blocked
+        # fetch can NOT prove a citation fabricated — degrade to the conservative `ambiguous`.
         return ("ambiguous", "")
 
     cls = _classify_retrievability(response.status_code, transport_error=False)

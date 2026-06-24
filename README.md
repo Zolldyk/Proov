@@ -509,6 +509,40 @@ Cost is **operator-internal** — it never enters the `Report`, the deliverable 
 `report_hash`-ed receipt. Proven **offline / $0**: injected providers, fake `429`s
 (`httpx.MockTransport`), and per-test cost constants — no real network, quota, or spend.
 
+## Hire Proov (for agent builders)
+
+You run an agent that produces text — research, summaries, answers, analyses — and you want a
+*verifiable* acceptance step before you ship that output to your own user. **Proov is that step.**
+It is a CROO/CAP agent that takes an output (plus any cited `sources`) and returns a
+source-grounded, deterministic verdict with an **on-chain receipt** you can show anyone.
+
+**Two services** (`proov/services.py` — confirmed live by real paid orders):
+
+| Service     | Price  | SLA    | What you get |
+|-------------|--------|--------|--------------|
+| Quick Check | $0.10  | 5 min  | Provided-source citation check + per-claim judgment over the output |
+| Deep Verify | $0.50  | 30 min | Quick + multi-source discovery, multi-pass self-consistency, a `report_file` |
+
+**How to hire it (agent-to-agent over CAP):**
+
+1. Discover Proov's `service_id` on CROO (or use the published ids in `proov/services.py`).
+2. **Negotiate** an order against that service; the `requirements` is a JSON string —
+   `{"output": "<the text to verify>", "mode": "quick" | "deep", "sources": [{"url": "..."}]}`
+   (see "Input/output contract" below; `sources` is optional).
+3. **Pay** the order (real USDC on Base) and await completion.
+4. **`get_delivery`** — you receive the PRD §6 deliverable: `verdict`
+   (`pass`/`fail`/`partial`/`unverifiable`), `confidence`, per-claim `claims[]`, `citations_checked[]`,
+   a `receipt`, and a **`verified_by_proov`** artifact. On a passing, anchored order the artifact
+   carries the on-chain transaction + a BaseScan link.
+5. **Embed the "Verified by Proov" badge** on your own delivery and **verify the receipt**
+   yourself any time — see "[Verifying a receipt](#verifying-a-receipt)".
+
+`scripts/research_caller.py` is a **working reference buyer** that does exactly this (negotiate →
+pay → `get_delivery` → embed the badge). Want a free taste first? Paste an output into the
+[Try this](#try-this-free-off-protocol-demo) page — same engine, no order, no payment. Then place a
+real **$0.10 Quick Check** to get the on-chain-anchored badge. For the recruiting angle and target
+list, see [`docs/outreach-playbook.md`](docs/outreach-playbook.md).
+
 ## Try this (free off-protocol demo)
 
 The first user-facing surface — a minimal web page to paste an AI output and get it verified,
@@ -522,11 +556,18 @@ It runs the **exact same verification pipeline a paid order runs** — `validate
 engine.verify → build_deliverable` — and re-implements none of the verdict/extraction/judgment
 logic; it only orchestrates the existing entrypoints (the testable core is `proov/webdemo.py`;
 the runner is a thin stdlib `http.server`, **no new dependency**). The page shows the verdict,
-the per-claim evidence trail, the citation flags, the receipt, and the full deliverable JSON.
+the per-claim evidence trail, the citation flags, the **rendered "Verified by Proov" badge**, the
+receipt, and the full deliverable JSON.
 
 It is a **free, off-protocol preview**: no CAP order is placed, no payment is made, and the
 embedded `receipt` is computed but **not anchored on-chain** (`verified_by_proov.anchor` is
-`null`). The paid on-chain order and the rendered "Verified by Proov" badge come later in Epic 4.
+`null`). The badge renders in its **un-anchored preview** form (it says "preview — not anchored
+on-chain" and shows no BaseScan link — the renderer never fabricates proof). **Trial friction
+(FR19):** sample Proov here for free, then place a real **$0.10 Quick Check order** (the floor
+price) on-protocol to get the **on-chain-anchored, tx-bearing** badge to embed on your own
+delivery — see "Place a test order" / the Companion Research caller below. No coupon/credit
+mechanism is built (deferred); the $0.10 floor + this free demo + the rendered badge **are** the
+low-risk first taste. Landing the real external orders that must dominate is Story 4.4.
 
 Runs as its own process, separate from the provider (`python -m proov`) — start both side by
 side on the always-on host. With **no API keys** it runs `$0` offline (stub LLM + Wikipedia) and
@@ -553,7 +594,10 @@ The testable composition core is `proov/companion.py` (SDK-agnostic — no `croo
 the runner is a thin `croo-sdk` buyer cloned from `scripts/place_test_order.py` (**no new
 dependency**). It re-implements none of the verification/receipt/badge logic — `extract_verified_
 artifact` is the **FR16 reuse seam** consumed from the *buyer* side: a tx-bearing badge when the
-order anchors on-chain, the in-band badge otherwise.
+order anchors on-chain, the in-band badge otherwise. The runner also **prints the rendered badge**
+on the caller's composed delivery (`render_companion_delivery_markdown`, Markdown to stdout) — so
+the demo literally shows "Verified by Proov" rendering on a caller's delivery (FR16 in use): the
+tx-bearing badge with the BaseScan link when the order anchored, the honest preview otherwise.
 
 - **Distinct identity / anti-self-trade.** Run it on its own `CROO_COMPANION_API_KEY` (a separately
   registered agent), and set `PROOV_OWN_AGENT_IDS` to that agent's id so `scripts/dashboard.py`
@@ -741,6 +785,19 @@ tx-bearing artifact in *its own* deliverable (e.g. a `proof.verified_by_proov` f
 buyer can trace the chain: the caller's deliverable → the embedded artifact →
 `anchor.content_hash` / `anchor.deliver_tx_hash` on [Base](https://basescan.org) → the Proov
 receipt that re-hashes to it.
+
+**Rendering the badge.** The artifact above is a JSON payload; `proov/badge.py` also turns it into
+a **visible, embeddable** badge — `render_badge_markdown(artifact)` and `render_badge_html(artifact)`
+(pure, stdlib `html` only, self-contained inline styling — **no** external image host / shields.io,
+so it stays `$0`/offline). It renders on the [Try this](#try-this-free-off-protocol-demo) result
+page and on the Companion caller's printed delivery. Two honesty invariants the renderer enforces:
+
+- **Verdict** — the affirmative "✓ Verified by Proov" form renders **only** when `verdict == "pass"`
+  (the same gate `compose_delivery` uses). A `fail` / `partial` / `unverifiable` / missing verdict
+  renders a neutral form showing the real verdict ("Proov: partial", …), never the green form.
+- **Anchor** — the BaseScan tx link + on-chain `content_hash` receipt id render **only** for the
+  tx-bearing (anchored) form. The in-band / off-protocol **preview** form (`anchor: null`) says
+  "preview — not anchored on-chain" and shows **no** tx link — the renderer never fabricates proof.
 
 ## Tests
 

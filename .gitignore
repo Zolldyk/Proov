@@ -31,6 +31,8 @@ dist/
 
 # ---- Local data (SQLite cache / metrics ledger) ----
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 

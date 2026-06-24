@@ -16,6 +16,8 @@ from proov.badge import (
     build_anchor,
     build_verified_artifact,
     explorer_tx_url,
+    render_badge_html,
+    render_badge_markdown,
 )
 
 # Hand-built sample `receipt` — exactly the eight keys `build_receipt` emits (proov.receipt).
@@ -160,3 +162,99 @@ def test_build_verified_artifact_empty_receipt_does_not_crash():
     artifact = build_verified_artifact({})
     assert artifact["schema"] == BADGE_SCHEMA
     assert artifact["receipt_id"] is None  # nothing to anchor to, but no exception
+
+
+# --- Story 4.3: the badge RENDERER (visible, embeddable HTML + Markdown) -----------------------
+
+_AFFIRMATIVE = "✓ Verified by Proov"
+
+
+def _tx_bearing_pass_artifact() -> dict:
+    receipt = _sample_receipt()
+    receipt["verdict"] = "pass"
+    anchor = build_anchor(
+        order_id="ord-1",
+        content_hash="0xcontenthash",
+        deliver_tx_hash="0xdeadbeef",
+        delivery_id="dlv-1",
+    )
+    return build_verified_artifact(receipt, anchor=anchor)
+
+
+def _in_band_pass_artifact() -> dict:
+    receipt = _sample_receipt()
+    receipt["verdict"] = "pass"
+    return build_verified_artifact(receipt)  # anchor=None → preview form
+
+
+# AC2/AC3: a tx-bearing pass renders affirmative WITH the BaseScan link + content_hash receipt id.
+def test_render_html_tx_bearing_pass_is_affirmative_with_basescan_link():
+    html_str = render_badge_html(_tx_bearing_pass_artifact())
+    assert _AFFIRMATIVE in html_str
+    assert "https://basescan.org/tx/0xdeadbeef" in html_str
+    assert "0xcontenthash" in html_str  # receipt_id == content_hash when anchored
+
+
+def test_render_markdown_tx_bearing_pass_is_affirmative_with_basescan_link():
+    md = render_badge_markdown(_tx_bearing_pass_artifact())
+    assert _AFFIRMATIVE in md
+    assert "basescan.org/tx/0xdeadbeef" in md
+    assert "0xcontenthash" in md
+
+
+# AC3: the in-band/preview form (anchor=null) says "preview", shows report_hash, NO tx link.
+def test_render_in_band_preview_says_preview_and_has_no_tx_link():
+    for render in (render_badge_html, render_badge_markdown):
+        out = render(_in_band_pass_artifact())
+        assert "preview" in out.lower()
+        assert "not anchored" in out.lower()
+        assert "basescan.org" not in out  # never fabricate a proof link
+        assert "0xreport" in out  # receipt_id == report_hash (pre-delivery stable)
+
+
+# AC2: a non-pass verdict NEVER renders the affirmative green form; the real verdict IS surfaced.
+def test_render_non_pass_verdict_is_not_affirmative():
+    for verdict in ("fail", "partial", "unverifiable"):
+        receipt = _sample_receipt()
+        receipt["verdict"] = verdict
+        artifact = build_verified_artifact(receipt)
+        for out in (render_badge_html(artifact), render_badge_markdown(artifact)):
+            assert _AFFIRMATIVE not in out
+            assert verdict in out
+
+
+# AC8: a None / error / non-badge / partial artifact degrades to honest "unverified", never raises.
+def test_render_degrades_on_bad_artifact_without_raising():
+    for bad in (None, {"error": "no_receipt", "reason": "x"}, {"schema": "other"}, "nope", {}):
+        html_str = render_badge_html(bad)  # type: ignore[arg-type]
+        md = render_badge_markdown(bad)  # type: ignore[arg-type]
+        assert isinstance(html_str, str) and isinstance(md, str)
+        assert _AFFIRMATIVE not in html_str and _AFFIRMATIVE not in md
+        assert "unverified" in html_str.lower()
+        assert "unverified" in md.lower()
+        assert "basescan.org" not in html_str  # no fabricated proof
+
+
+# AC4: the HTML renderer html.escapes every interpolated value (reflected-XSS guard).
+def test_render_html_escapes_xss_in_values():
+    receipt = _sample_receipt()
+    receipt["verdict"] = '<script>alert("x")</script>'
+    receipt["model"] = '<img src=x onerror=alert(1)>'
+    html_str = render_badge_html(build_verified_artifact(receipt))
+    assert "<script>alert" not in html_str
+    assert "<img src=x" not in html_str
+    assert "&lt;script&gt;" in html_str
+
+
+# AC4: the Markdown renderer neutralises link/markup-breaking characters in interpolated values.
+def test_render_markdown_neutralises_link_breaking_chars():
+    receipt = _sample_receipt()
+    receipt["verdict"] = "pass](http://evil.example)"  # tries to break out of a markdown link
+    md = render_badge_markdown(build_verified_artifact(receipt))
+    assert "](http://evil.example)" not in md  # the injected link syntax is escaped
+
+
+def test_render_badge_html_and_markdown_are_pure_strings():
+    artifact = _tx_bearing_pass_artifact()
+    assert isinstance(render_badge_html(artifact), str)
+    assert isinstance(render_badge_markdown(artifact), str)
