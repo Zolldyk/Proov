@@ -85,19 +85,31 @@ def build_verified_artifact(receipt: dict, *, anchor: dict | None = None) -> dic
     `receipt_id` is the pre-delivery-stable `report_hash` when there is no `anchor`
     (in-band form), and the on-chain `content_hash` once the `anchor` is known
     (post-delivery form). The `verify` block tells a third party exactly how to re-verify.
+
+    Hardened (Story 4.2): this FR16 reuse seam is now invoked **directly** by the Epic-4
+    companion caller (`proov.companion.extract_verified_artifact`), so a partial/missing
+    `receipt` or a non-dict `anchor`/`anchor_ref` must yield a sensible artifact (missing fields
+    → `None`) instead of raising `KeyError`/`TypeError` — resolving the 1.6-review deferred-work
+    item. `.get` defaults + `isinstance` guards do this WITHOUT changing the bytes of a *complete*
+    receipt's artifact: every field below resolves identically for the full eight-key shape
+    `build_receipt` emits, so `report_hash`/`receipt_id` (hashed — Story 1.4) never shift.
     """
+    r = receipt if isinstance(receipt, dict) else {}
+    anchor = anchor if isinstance(anchor, dict) else None
+    anchor_ref = r.get("anchor_ref")
     return {
         "issuer": ISSUER,
         "schema": BADGE_SCHEMA,
-        "version": receipt["version"],
-        "verdict": receipt["verdict"],
-        "confidence": receipt["confidence"],
-        "model": receipt["model"],
-        "timestamp": receipt["timestamp"],
-        "output_hash": receipt["output_hash"],
-        "report_hash": receipt["report_hash"],
-        # Copy — never alias the receipt's nested dict (mutating one must not touch the other).
-        "anchor_ref": dict(receipt["anchor_ref"]),
+        "version": r.get("version"),
+        "verdict": r.get("verdict"),
+        "confidence": r.get("confidence"),
+        "model": r.get("model"),
+        "timestamp": r.get("timestamp"),
+        "output_hash": r.get("output_hash"),
+        "report_hash": r.get("report_hash"),
+        # Copy — never alias the receipt's nested dict (mutating one must not touch the other);
+        # tolerate a missing/non-dict `anchor_ref` → `None` rather than crashing on `dict(...)`.
+        "anchor_ref": dict(anchor_ref) if isinstance(anchor_ref, dict) else None,
         # Copy — never alias the caller's anchor dict (consistency with anchor_ref above; a
         # caller that reuses/mutates its anchor must not mutate this finalised artifact).
         "anchor": dict(anchor) if anchor else None,
@@ -105,7 +117,7 @@ def build_verified_artifact(receipt: dict, *, anchor: dict | None = None) -> dic
         # report_hash. Guard on the *value* (not just dict-presence) so an anchor that lacks
         # content_hash (or carries None) falls back to report_hash rather than yielding a
         # null receipt_id.
-        "receipt_id": (anchor.get("content_hash") if anchor else None) or receipt["report_hash"],
+        "receipt_id": (anchor.get("content_hash") if anchor else None) or r.get("report_hash"),
         "verify": {"rule": _VERIFY_RULE, "procedure": _VERIFY_PROCEDURE},
     }
 

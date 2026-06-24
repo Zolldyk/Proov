@@ -115,3 +115,48 @@ def test_explorer_tx_url_returns_none_for_falsy_hash():
     assert explorer_tx_url("") is None
     assert explorer_tx_url(None) is None
     assert explorer_tx_url("0xabc") == "https://basescan.org/tx/0xabc"
+
+
+# --- Story 4.2 Task 4: the FR16 seam is hardened for direct consumer (companion) use ----------
+
+
+def test_build_verified_artifact_complete_receipt_bytes_unchanged():
+    # Regression: the hardening must NOT shift the artifact a COMPLETE receipt produces — the
+    # report_hash/receipt_id are hashed (Story 1.4) and any change would break re-verification.
+    receipt = _sample_receipt()
+    artifact = build_verified_artifact(receipt)
+    assert artifact["receipt_id"] == receipt["report_hash"]
+    assert artifact["anchor_ref"] == receipt["anchor_ref"]
+    for key in ("version", "verdict", "confidence", "model", "timestamp",
+                "output_hash", "report_hash"):
+        assert artifact[key] == receipt[key]
+
+
+def test_build_verified_artifact_tolerates_partial_receipt():
+    # A partial receipt (missing version/anchor_ref) must yield a sensible artifact, never crash —
+    # the FR16 seam is now invoked directly by proov.companion.extract_verified_artifact.
+    partial = {"report_hash": "0xpartial", "verdict": "pass"}
+    artifact = build_verified_artifact(partial)
+    assert artifact["report_hash"] == "0xpartial"
+    assert artifact["verdict"] == "pass"
+    assert artifact["version"] is None  # missing field → None, not KeyError
+    assert artifact["anchor_ref"] is None  # missing/non-dict anchor_ref → None, not a crash
+    assert artifact["receipt_id"] == "0xpartial"
+    assert artifact["schema"] == BADGE_SCHEMA  # still a recognisable badge
+
+
+def test_build_verified_artifact_tolerates_non_dict_anchor_ref_and_anchor():
+    # A non-dict anchor_ref / a non-dict anchor argument must not raise.
+    receipt = _sample_receipt()
+    receipt["anchor_ref"] = "not-a-dict"  # corrupt shape
+    artifact = build_verified_artifact(receipt, anchor="not-a-dict")  # type: ignore[arg-type]
+    assert artifact["anchor_ref"] is None
+    assert artifact["anchor"] is None
+    # No live content_hash (anchor was ignored) → falls back to report_hash.
+    assert artifact["receipt_id"] == receipt["report_hash"]
+
+
+def test_build_verified_artifact_empty_receipt_does_not_crash():
+    artifact = build_verified_artifact({})
+    assert artifact["schema"] == BADGE_SCHEMA
+    assert artifact["receipt_id"] is None  # nothing to anchor to, but no exception

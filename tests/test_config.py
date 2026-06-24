@@ -7,7 +7,13 @@ import pytest
 
 from proov.config import AppConfig, ConfigError
 
-_VARS = ("CROO_API_URL", "CROO_WS_URL", "CROO_API_KEY", "CROO_REQUESTER_API_KEY")
+_VARS = (
+    "CROO_API_URL",
+    "CROO_WS_URL",
+    "CROO_API_KEY",
+    "CROO_REQUESTER_API_KEY",
+    "CROO_COMPANION_API_KEY",
+)
 _SECRET = "croo_sk_supersecret_value_should_never_leak"
 
 
@@ -37,6 +43,7 @@ def test_from_env_parses_quotes_comments_and_blanks(tmp_path):
                 f"CROO_API_KEY={_SECRET}",
                 "   # indented comment",
                 "CROO_REQUESTER_API_KEY=croo_sk_requester",
+                "CROO_COMPANION_API_KEY=croo_sk_companion",
             ]
         ),
     )
@@ -46,6 +53,8 @@ def test_from_env_parses_quotes_comments_and_blanks(tmp_path):
     assert cfg.ws_url == "wss://api.croo.network/ws"  # single quotes stripped
     assert cfg.api_key == _SECRET
     assert cfg.requester_api_key == "croo_sk_requester"
+    # Story 4.2: the companion Research caller's distinct agent key (optional).
+    assert cfg.companion_api_key == "croo_sk_companion"
 
 
 def test_real_env_is_not_overwritten_by_dotenv(tmp_path, monkeypatch):
@@ -103,3 +112,4 @@ def test_missing_env_file_is_a_noop(tmp_path, monkeypatch):
     cfg = AppConfig.from_env(env_file=tmp_path / "does-not-exist.env")
     assert cfg.api_key == _SECRET
     assert cfg.requester_api_key is None  # optional, absent
+    assert cfg.companion_api_key is None  # optional, absent

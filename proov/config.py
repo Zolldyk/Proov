@@ -32,6 +32,9 @@ class AppConfig:
     api_key: str
     # Used from Story 1.3+ (test buyer places orders); optional here.
     requester_api_key: str | None = None
+    # Used from Story 4.2 — the companion Research caller (scripts/research_caller.py) places
+    # composition orders as a DISTINCT registered agent; optional here.
+    companion_api_key: str | None = None
 
     @classmethod
     def from_env(cls, env_file: str | os.PathLike[str] | None = ".env") -> "AppConfig":
@@ -54,6 +57,7 @@ class AppConfig:
             ws_url=os.environ["CROO_WS_URL"],
             api_key=os.environ["CROO_API_KEY"],
             requester_api_key=os.environ.get("CROO_REQUESTER_API_KEY") or None,
+            companion_api_key=os.environ.get("CROO_COMPANION_API_KEY") or None,
         )
 
 

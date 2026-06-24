@@ -536,6 +536,41 @@ cost ceiling (`PROOV_MAX_ORDER_COST_USD`) still applies inside `verify`. Host/po
 `PROOV_TRYTHIS_HOST` / `PROOV_TRYTHIS_PORT`; a public bind spends free-tier quota, so keep the
 default `127.0.0.1` unless you intend a public demo.
 
+## Companion Research caller (composition demo)
+
+The on-protocol counterpart to "Try this": a thin, **separate** "Research" agent that hires Proov
+as its **acceptance step**. It produces a research-style output, places a **real paid Quick Check
+order** against Proov over CAP (negotiate → pay → await completion → `get_delivery`), waits for
+the verdict, then attaches Proov's on-chain **"Verified by Proov"** badge to its own delivery —
+a genuine **agent-hires-agent (A2A)** relationship, visible via `list_orders` / on Base.
+
+```sh
+python scripts/research_caller.py        # Proov must already be online (python -m proov)
+```
+
+The testable composition core is `proov/companion.py` (SDK-agnostic — no `croo` import:
+`make_research_output` / `build_proov_input` / `extract_verified_artifact` / `compose_delivery`);
+the runner is a thin `croo-sdk` buyer cloned from `scripts/place_test_order.py` (**no new
+dependency**). It re-implements none of the verification/receipt/badge logic — `extract_verified_
+artifact` is the **FR16 reuse seam** consumed from the *buyer* side: a tx-bearing badge when the
+order anchors on-chain, the in-band badge otherwise.
+
+- **Distinct identity / anti-self-trade.** Run it on its own `CROO_COMPANION_API_KEY` (a separately
+  registered agent), and set `PROOV_OWN_AGENT_IDS` to that agent's id so `scripts/dashboard.py`
+  attributes its orders to **self-trade** and **excludes** them from the external-buyer count
+  (see the dashboard's **self-trade ratio**). If a dedicated key is friction, it falls back to
+  `CROO_REQUESTER_API_KEY` (then put the requester's agent id in `PROOV_OWN_AGENT_IDS`).
+- **Run it sparingly — it is a demo.** Companion orders must remain a **minority** of total:
+  external orders must dominate (landing those is Story 4.4). The self-trade ratio keeps this honest.
+- **Funding.** The live `pay_order` settles **real USDC on Base** (no testnet) with an on-chain
+  balance pre-check — it raises `InsufficientBalanceError` until the companion wallet is funded,
+  exactly like the smoke harness. The automated suite covers the composition logic offline (`$0`);
+  the live order is the funding-gated smoke run. The output to verify is `make_research_output()`
+  (a built-in sample, or `PROOV_RESEARCH_TOPIC`).
+
+Runs as its **own process on its own key** (one-WS-per-key / 1008), distinct from the provider's
+and the requester's — start it alongside `python -m proov`.
+
 ## Input/output contract
 
 The submitted input is the negotiation's `requirements` JSON string:
