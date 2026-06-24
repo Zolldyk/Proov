@@ -509,6 +509,33 @@ Cost is **operator-internal** — it never enters the `Report`, the deliverable 
 `report_hash`-ed receipt. Proven **offline / $0**: injected providers, fake `429`s
 (`httpx.MockTransport`), and per-test cost constants — no real network, quota, or spend.
 
+## Try this (free off-protocol demo)
+
+The first user-facing surface — a minimal web page to paste an AI output and get it verified,
+without placing a CAP order:
+
+```sh
+python scripts/try_this.py        # serves on http://127.0.0.1:8080 by default
+```
+
+It runs the **exact same verification pipeline a paid order runs** — `validate_requirements →
+engine.verify → build_deliverable` — and re-implements none of the verdict/extraction/judgment
+logic; it only orchestrates the existing entrypoints (the testable core is `proov/webdemo.py`;
+the runner is a thin stdlib `http.server`, **no new dependency**). The page shows the verdict,
+the per-claim evidence trail, the citation flags, the receipt, and the full deliverable JSON.
+
+It is a **free, off-protocol preview**: no CAP order is placed, no payment is made, and the
+embedded `receipt` is computed but **not anchored on-chain** (`verified_by_proov.anchor` is
+`null`). The paid on-chain order and the rendered "Verified by Proov" badge come later in Epic 4.
+
+Runs as its own process, separate from the provider (`python -m proov`) — start both side by
+side on the always-on host. With **no API keys** it runs `$0` offline (stub LLM + Wikipedia) and
+still returns an honest result, but the keyless stub is **optimistic** (it judges every
+Wikipedia-backed claim supported) — **set `GEMINI_API_KEY` for a meaningful demo**. The per-order
+cost ceiling (`PROOV_MAX_ORDER_COST_USD`) still applies inside `verify`. Host/port are
+`PROOV_TRYTHIS_HOST` / `PROOV_TRYTHIS_PORT`; a public bind spends free-tier quota, so keep the
+default `127.0.0.1` unless you intend a public demo.
+
 ## Input/output contract
 
 The submitted input is the negotiation's `requirements` JSON string:
