@@ -10,6 +10,7 @@ from proov.metrics import (
     MetricsReport,
     OrderRecord,
     compute_metrics,
+    estimate_claim_cost,
     estimate_order_cost,
     resolve_own_agent_ids,
 )
@@ -199,6 +200,42 @@ def test_estimate_order_cost_unknown_tier_uses_quick_var(monkeypatch):
     monkeypatch.delenv("PROOV_DEEP_COST_USD", raising=False)
     # Anything that is not exactly "deep" reads the QUICK var (permissive default).
     assert estimate_order_cost("weird") == 0.07
+
+
+# --------------------------------------------------------------------------- estimate_claim_cost (Story 3.4)
+
+
+def test_estimate_claim_cost_defaults_zero(monkeypatch):
+    # Default $0 on the free-tier stack → the engine's cost meter is inert (the $0 path).
+    monkeypatch.delenv("PROOV_QUICK_CLAIM_COST_USD", raising=False)
+    monkeypatch.delenv("PROOV_DEEP_CLAIM_COST_USD", raising=False)
+    assert estimate_claim_cost("quick") == 0.0
+    assert estimate_claim_cost("deep") == 0.0
+
+
+def test_estimate_claim_cost_env_override(monkeypatch):
+    # Each tier reads its OWN per-claim cost var (distinct from the per-order COST_USD vars).
+    monkeypatch.setenv("PROOV_QUICK_CLAIM_COST_USD", "0.001")
+    monkeypatch.setenv("PROOV_DEEP_CLAIM_COST_USD", "0.01")
+    assert estimate_claim_cost("quick") == 0.001
+    assert estimate_claim_cost("deep") == 0.01
+
+
+def test_estimate_claim_cost_garbage_or_nonfinite_falls_back_to_zero(monkeypatch):
+    # Garbage / inf / nan → 0.0 so a poisoned constant can never spuriously stop an order early.
+    monkeypatch.setenv("PROOV_QUICK_CLAIM_COST_USD", "not-a-number")
+    monkeypatch.setenv("PROOV_DEEP_CLAIM_COST_USD", "inf")
+    assert estimate_claim_cost("quick") == 0.0
+    assert estimate_claim_cost("deep") == 0.0
+    monkeypatch.setenv("PROOV_DEEP_CLAIM_COST_USD", "nan")
+    assert estimate_claim_cost("deep") == 0.0
+
+
+def test_estimate_claim_cost_unknown_tier_uses_quick_var(monkeypatch):
+    monkeypatch.setenv("PROOV_QUICK_CLAIM_COST_USD", "0.003")
+    monkeypatch.delenv("PROOV_DEEP_CLAIM_COST_USD", raising=False)
+    # Anything not exactly "deep" reads the QUICK var (mirrors estimate_order_cost).
+    assert estimate_claim_cost("weird") == 0.003
 
 
 # --------------------------------------------------------------------------- resolve_own_agent_ids

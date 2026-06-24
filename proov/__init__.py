@@ -25,7 +25,11 @@ provider writes at every terminal order (mirroring `cache`'s degrade-don't-drop 
 ledger under `--live`. As of Story 3.3 the provider is reliability-hardened — a worker-pool throttle
 bounds concurrent verifications within free-tier RPM, per-claim/per-order SLA bounds degrade to an
 honest `partial` instead of overrunning the wall, and a graceful shutdown drains in-flight
-settlements (auto-reconnect itself stays owned by the SDK's `EventStream`). Only `[A]` is
+settlements (auto-reconnect itself stays owned by the SDK's `EventStream`). As of Story 3.4 the
+$0-marginal promise (NFR1) is enforced by cost guardrails: quota-aware LLM/search fallback chains
+route a free-tier `429` to a free provider (`[Gemini 429]→[Stub]`, `[Tavily 429]→[Wikipedia]`), a
+per-order cost ceiling stops spend early (degrading to an honest `partial`), and a buyer-source cap
+bounds paid-call amplification — all inert by default so the stack stays $0. Only `[A]` is
 CROO-coupled — `[B]`/`[C]`/`[D]`/`[E]` stay pure, SDK-agnostic Python.
 """
 

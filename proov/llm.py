@@ -129,6 +129,17 @@ class LLMError(RuntimeError):
     """
 
 
+class LLMQuotaError(LLMError):
+    """A free-tier rate-limit / quota-exhausted signal (HTTP 429 / `RESOURCE_EXHAUSTED`).
+
+    Raised by `GeminiProvider` SPECIFICALLY on a 429 status so the top-level entrypoints can
+    route the call to the next provider in the chain — the LLM twin of search's
+    `[Tavily 429]→[Wikipedia]` fall-through (Story 3.4 / NFR1). It subclasses `LLMError`, so
+    every existing `except LLMError` (the engine's graceful wrapper, the per-claim degrade)
+    still catches it — quota is a *kind of* call failure, just one worth routing past.
+    """
+
+
 @runtime_checkable
 class LLMProvider(Protocol):
     """Structural interface every LLM provider satisfies.
@@ -341,6 +352,11 @@ class GeminiProvider:
             # Transport / status / timeout — a real failure. Raise typed so the engine's
             # graceful seam degrades it to `unverifiable` (degrade, don't drop — NFR3).
             # Do NOT let an outage masquerade as a confident empty extraction.
+            # A 429 is a quota/rate-limit signal → raise the routing subclass so the chain
+            # falls through to the next provider (the $0 Stub tail). Only an `HTTPStatusError`
+            # carries `.response`; a transport/timeout error has none → stays a plain LLMError.
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+                raise LLMQuotaError("Gemini extract_claims hit a 429 quota/rate limit") from exc
             raise LLMError(f"Gemini extract_claims call failed: {exc!r}") from exc
 
         # A successful 200 whose body is unparseable / candidate-less / claim-less is a
@@ -397,6 +413,10 @@ class GeminiProvider:
             # Transport / status / timeout — a real failure. Raise typed so the top-level
             # `judge_claim` entrypoint can log the real reason and degrade this ONE claim to
             # unverifiable. Do NOT let an outage masquerade as a confident unverifiable here.
+            # A 429 is a quota/rate-limit signal → raise the routing subclass so the chain
+            # falls through to the next provider per-pass. Guard `.response` on the status type.
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+                raise LLMQuotaError("Gemini judge_claim hit a 429 quota/rate limit") from exc
             raise LLMError(f"Gemini judge_claim call failed: {exc!r}") from exc
 
         # A successful 200 whose body is unparseable / shape-less is the VALID-empty judgment
@@ -438,6 +458,36 @@ def get_llm_provider(name: str | None = None) -> LLMProvider:
     raise LLMError(f"Unknown LLM provider: {resolved!r}")
 
 
+def default_llm_chain() -> list[LLMProvider]:
+    """Build the ordered LLM provider chain — the quota-aware fallback (Story 3.4, NFR1).
+
+    The structural twin of `search.default_search_chain` (the module already calls itself
+    "the structural twin of `proov/search.py`" — this closes the one feature it was missing):
+
+    - If `PROOV_LLM_PROVIDER` is set, return that SINGLE forced provider (via
+      `get_llm_provider()`) — an operator override is honoured verbatim, no surprise tail.
+    - Otherwise build `[GeminiProvider] if a key is present else []` **followed by** the
+      always-available keyless offline `StubLLMProvider` `$0` tail — Gemini-first-when-keyed,
+      always ending in the no-key provider (the LLM analogue of keyless Wikipedia ending the
+      search chain), so the chain is **never empty** and a Gemini 429 routes to a free $0
+      verification instead of dropping the order's claims (degrade, don't drop — NFR3).
+
+    Cerebras/Groq/Ollama (architecture §6) are documented pluggable slots: a future story adds
+    a provider class + an entry here, with NO engine change (the whole point of the Protocol).
+    """
+    if os.environ.get("PROOV_LLM_PROVIDER"):
+        return [get_llm_provider()]
+
+    chain: list[LLMProvider] = []
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if api_key:
+        model = os.environ.get("PROOV_LLM_MODEL") or _DEFAULT_MODEL
+        timeout = _resolve_timeout(os.environ.get("PROOV_LLM_TIMEOUT"))
+        chain.append(GeminiProvider(api_key=api_key, model=model, timeout=timeout))
+    chain.append(StubLLMProvider())
+    return chain
+
+
 def _resolve_timeout(raw: str | None) -> float:
     """Parse `PROOV_LLM_TIMEOUT`, tolerating garbage by falling back to the default."""
     if raw is None:
@@ -453,11 +503,28 @@ def _resolve_timeout(raw: str | None) -> float:
     return value
 
 
+def _resolve_chain(
+    providers: list[LLMProvider] | None, provider: LLMProvider | None
+) -> list[LLMProvider]:
+    """Resolve the active LLM provider chain for an entrypoint call (Story 3.4).
+
+    Precedence: an explicit `providers` chain (what the engine passes — `default_llm_chain()`
+    resolved once) wins; else a single back-compat `provider` becomes a one-element chain (so
+    the existing `provider=`-injecting tests are untouched); else build `default_llm_chain()`.
+    """
+    if providers is not None:
+        return providers
+    if provider is not None:
+        return [provider]
+    return default_llm_chain()
+
+
 async def extract_claims(
     text: str,
     tier: Tier,
     *,
     provider: LLMProvider | None = None,
+    providers: list[LLMProvider] | None = None,
     options: dict | None = None,
     explicit_claims: list[str] | None = None,
 ) -> list[Claim]:
@@ -465,8 +532,12 @@ async def extract_claims(
 
     Resolves the tier cap (lowerable via `options.max_claims`), then: if `explicit_claims`
     is supplied and non-empty, uses them verbatim (normalised + capped) with NO LLM call
-    (PRD §6 explicit-`claims` bypass, AC4); otherwise delegates to `provider` (or the
-    factory default) — which honours `max_claims` defensively too.
+    (PRD §6 explicit-`claims` bypass, AC4); otherwise routes through the **provider chain**
+    (Story 3.4): each provider is tried in order and an `LLMError` (quota OR generic) routes to
+    the next, so a Gemini 429 falls through to the `$0` Stub tail rather than dropping the
+    order's claims. A successful (incl. validly-empty `[]`) extraction is returned immediately
+    — only a *failure* falls through. If the whole chain fails (or is empty) the last
+    `LLMError` is re-raised so the engine's graceful wrapper degrades it to zero claims.
     """
     cap = max_claims_for_tier(tier, options)
     if explicit_claims:
@@ -476,8 +547,19 @@ async def extract_claims(
         normalised = _normalise_claims(explicit_claims, cap)
         if normalised:
             return normalised
-    active = provider if provider is not None else get_llm_provider()
-    return await active.extract_claims(text, cap)
+    chain = _resolve_chain(providers, provider)
+    last_error: LLMError | None = None
+    for active in chain:
+        try:
+            return await active.extract_claims(text, cap)
+        except LLMError as exc:
+            last_error = exc
+            logger.warning("extract_claims provider failed, routing to next provider: %r", exc)
+            continue
+    # Chain exhausted (or empty): re-raise so the engine degrades to zero claims (→ partial).
+    raise last_error if last_error is not None else LLMError(
+        "extract_claims has no available LLM provider"
+    )
 
 
 def _resolve_deep_passes(raw: str | None = None) -> int:
@@ -547,12 +629,32 @@ def _consensus_judgment(judgments: list[Judgment]) -> Judgment:
     return Judgment(status, confidence, evidence)
 
 
+async def _judge_one_pass(
+    claim: Claim, evidence: list[Evidence], chain: list[LLMProvider]
+) -> Judgment:
+    """One judgment pass over the provider chain — first provider that answers wins (Story 3.4).
+
+    Walks `chain` in order; a provider that raises `LLMError` (incl. `LLMQuotaError`) routes to
+    the next provider for this pass. If every provider in the chain fails (or the chain is
+    empty), the pass degrades to an `unverifiable` vote — so the entrypoint never raises out
+    (degrade, don't drop — NFR3). Shared by the Quick single-pass and each Deep pass.
+    """
+    for active in chain:
+        try:
+            return await active.judge_claim(claim, list(evidence))
+        except LLMError as exc:
+            logger.warning("judge_claim provider failed, routing to next provider: %r", exc)
+            continue
+    return Judgment("unverifiable", 0.0, ())
+
+
 async def judge_claim(
     claim: Claim,
     evidence: list[Evidence],
     tier: Tier,
     *,
     provider: LLMProvider | None = None,
+    providers: list[LLMProvider] | None = None,
     options: dict | None = None,
 ) -> Judgment:
     """Provider-agnostic per-claim judgment entrypoint (the engine, Story 2.6, calls this).
@@ -564,36 +666,26 @@ async def judge_claim(
 
     - empty `evidence` → `Judgment("unverifiable", 0.0, ())` with NO provider call (no
       multi-pass spend on nothing);
-    - `tier == "quick"`: **single-pass** — delegate once to `provider` (or the
-      `get_llm_provider()` default); an `LLMError` degrades THIS claim to `unverifiable`.
-    - `tier == "deep"`: **multi-pass self-consistency** (Story 2.7 / architecture §4) — sample
-      the provider `_resolve_deep_passes()` times and reduce to one consensus via
-      `_consensus_judgment`. A pass that raises `LLMError` becomes an `unverifiable` vote (the
-      provider already maps `LLMError` → `unverifiable` internally; this catches a pass that
-      still raises out), so the entrypoint never raises. The provider classes and
-      `_normalise_judgment` are unchanged — multi-pass is orchestration here, not new provider
-      logic.
+    - `tier == "quick"`: **single-pass** over the provider chain (Story 3.4) — the first
+      provider that answers wins; a provider raising `LLMError`/`LLMQuotaError` routes to the
+      next (the `$0` Stub tail), and a fully-exhausted chain degrades THIS claim to
+      `unverifiable`.
+    - `tier == "deep"`: **multi-pass self-consistency** (Story 2.7 / architecture §4) — run
+      `_resolve_deep_passes()` passes, each itself a chain walk (`_judge_one_pass`): a pass
+      whose head provider 429s falls through to the next provider FOR THAT PASS; a fully-failed
+      pass becomes an `unverifiable` vote. Reduce to one consensus via `_consensus_judgment`.
+      The provider classes and `_normalise_judgment` are unchanged — multi-pass + chain routing
+      are orchestration here, not new provider logic.
     """
     if not evidence:
         return Judgment("unverifiable", 0.0, ())
-    active = provider if provider is not None else get_llm_provider()
+    chain = _resolve_chain(providers, provider)
 
     if tier == "deep":
-        votes: list[Judgment] = []
-        for _ in range(_resolve_deep_passes()):
-            try:
-                votes.append(await active.judge_claim(claim, list(evidence)))
-            except LLMError as exc:
-                logger.warning(
-                    "judge_claim Deep pass degraded to unverifiable after provider "
-                    "failure: %r",
-                    exc,
-                )
-                votes.append(Judgment("unverifiable", 0.0, ()))
+        votes = [
+            await _judge_one_pass(claim, evidence, chain)
+            for _ in range(_resolve_deep_passes())
+        ]
         return _consensus_judgment(votes)
 
-    try:
-        return await active.judge_claim(claim, list(evidence))
-    except LLMError as exc:
-        logger.warning("judge_claim degraded to unverifiable after provider failure: %r", exc)
-        return Judgment("unverifiable", 0.0, ())
+    return await _judge_one_pass(claim, evidence, chain)

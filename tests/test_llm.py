@@ -16,6 +16,7 @@ from proov.llm import (
     GeminiProvider,
     LLMError,
     LLMProvider,
+    LLMQuotaError,
     StubLLMProvider,
     _MAX_CONSENSUS_EVIDENCE,
     _MAX_DEEP_PASSES,
@@ -25,6 +26,7 @@ from proov.llm import (
     _normalise_judgment,
     _resolve_deep_passes,
     _resolve_timeout,
+    default_llm_chain,
     extract_claims,
     get_llm_provider,
     judge_claim,
@@ -710,3 +712,154 @@ async def test_deep_judge_empty_evidence_short_circuits_no_passes():
     result = await judge_claim(_CLAIM, [], "deep", provider=spy)
     assert result == Judgment("unverifiable", 0.0, ())
     assert spy.calls == []  # no multi-pass spend on nothing
+
+
+# ============================================================ Story 3.4: quota-aware fallback chain
+
+
+class _QuotaHead:
+    """A fake `LLMProvider` head whose every call raises `LLMQuotaError` (a 429-routing head).
+
+    Drives the chain-routing tests: a Gemini-shaped head that is quota-exhausted, so the
+    entrypoint must fall through to the next provider (the $0 Stub tail) for every call.
+    """
+
+    model = "quota-head"
+
+    def __init__(self) -> None:
+        self.extract_calls = 0
+        self.judge_calls = 0
+
+    async def extract_claims(self, text: str, max_claims: int) -> list[Claim]:
+        self.extract_calls += 1
+        raise LLMQuotaError("simulated 429")
+
+    async def judge_claim(self, claim: Claim, evidence: list[Evidence]) -> Judgment:
+        self.judge_calls += 1
+        raise LLMQuotaError("simulated 429")
+
+
+# ------------------------------------------------------------ default_llm_chain shapes (AC1b)
+
+
+def test_default_llm_chain_forced_single_when_provider_env_set(monkeypatch):
+    # PROOV_LLM_PROVIDER forces a SINGLE provider — no surprise Stub tail appended.
+    monkeypatch.setenv("PROOV_LLM_PROVIDER", "stub")
+    chain = default_llm_chain()
+    assert len(chain) == 1
+    assert isinstance(chain[0], StubLLMProvider)
+
+
+def test_default_llm_chain_keyed_is_gemini_then_stub(monkeypatch):
+    # A key present (and no forced provider) → Gemini-first, ALWAYS ending in the $0 Stub tail.
+    monkeypatch.delenv("PROOV_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", _DUMMY_KEY)
+    chain = default_llm_chain()
+    assert len(chain) == 2
+    assert isinstance(chain[0], GeminiProvider)
+    assert isinstance(chain[1], StubLLMProvider)  # keyless $0 tail (LLM analogue of Wikipedia)
+
+
+def test_default_llm_chain_unkeyed_is_stub_only(monkeypatch):
+    # No forced provider and no key → the chain is just the always-available $0 Stub (never empty).
+    monkeypatch.delenv("PROOV_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    chain = default_llm_chain()
+    assert len(chain) == 1
+    assert isinstance(chain[0], StubLLMProvider)
+
+
+# ------------------------------------------------------------ GeminiProvider 429 → LLMQuotaError (AC1a)
+
+
+async def test_gemini_extract_429_raises_quota_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": {"status": "RESOURCE_EXHAUSTED"}})
+
+    provider = _mock_gemini(handler)
+    with pytest.raises(LLMQuotaError):
+        await provider.extract_claims("some text", 20)
+
+
+async def test_gemini_judge_429_raises_quota_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": {"status": "RESOURCE_EXHAUSTED"}})
+
+    provider = _mock_gemini(handler)
+    with pytest.raises(LLMQuotaError):
+        await provider.judge_claim(_CLAIM, [_EV1])
+
+
+async def test_gemini_non_429_status_is_plain_llmerror_not_quota():
+    # A 500 is a generic failure, NOT a quota signal — it must stay a plain LLMError so it is
+    # not mistaken for a routable 429 (it routes too, but the type discriminates the cause).
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={})
+
+    provider = _mock_gemini(handler)
+    with pytest.raises(LLMError) as exc_info:
+        await provider.extract_claims("some text", 20)
+    assert not isinstance(exc_info.value, LLMQuotaError)
+
+
+# ------------------------------------------------------------ entrypoint chain routing (AC1c)
+
+
+async def test_extract_claims_routes_past_quota_head_to_stub_tail():
+    # A keyed-but-quota-exhausted order: the head 429s, the chain falls through to the $0 Stub
+    # tail, which serves the extraction — the order's claims are preserved, not dropped.
+    head = _QuotaHead()
+    chain = [head, StubLLMProvider()]
+    claims = await extract_claims("Paris is the capital of France.", "quick", providers=chain)
+    assert head.extract_calls == 1  # head WAS tried first
+    assert [c.text for c in claims] == ["Paris is the capital of France"]  # Stub tail served
+
+
+async def test_extract_claims_all_providers_fail_reraises_last_error():
+    # A forced single non-Stub chain that fully fails must re-raise so the engine degrades to
+    # zero claims (→ partial). Two quota heads, no Stub tail → the last LLMError propagates.
+    chain = [_QuotaHead(), _QuotaHead()]
+    with pytest.raises(LLMError):
+        await extract_claims("some text", "quick", providers=chain)
+
+
+async def test_extract_claims_empty_chain_raises_llmerror():
+    # An empty chain (the engine's degraded `chain = []`) raises so extraction → zero claims.
+    with pytest.raises(LLMError):
+        await extract_claims("some text", "quick", providers=[])
+
+
+async def test_judge_claim_quick_routes_past_quota_head_to_stub_tail():
+    head = _QuotaHead()
+    chain = [head, StubLLMProvider()]
+    result = await judge_claim(_CLAIM, [_EV1], "quick", providers=chain)
+    assert head.judge_calls == 1  # head tried first, 429'd
+    assert result.status == "supported"  # Stub tail judged (optimistic offline verdict)
+
+
+async def test_judge_claim_quick_all_fail_degrades_to_unverifiable():
+    # No Stub tail and every provider 429s → the entrypoint NEVER raises out; the claim degrades.
+    chain = [_QuotaHead(), _QuotaHead()]
+    result = await judge_claim(_CLAIM, [_EV1], "quick", providers=chain)
+    assert result == Judgment("unverifiable", 0.0, ())
+
+
+async def test_judge_claim_deep_falls_through_per_pass_to_stub_tail():
+    # Each Deep self-consistency pass walks the chain: head 429s per pass → Stub tail answers.
+    # 3 passes all "supported" → consensus supported. The head is hit once PER pass.
+    head = _QuotaHead()
+    chain = [head, StubLLMProvider()]
+    result = await judge_claim(_CLAIM, [_EV1], "deep", providers=chain)
+    assert head.judge_calls == _resolve_deep_passes()  # one fall-through per pass
+    assert result.status == "supported"
+
+
+async def test_provider_single_backcompat_unchanged():
+    # The pre-3.4 `provider=`-single param still works (a one-element chain), so the existing
+    # llm tests are untouched: a single spy provider serves the extraction with no chain.
+    spy = _SpyProvider()
+    claims = await extract_claims("text", "quick", provider=spy)
+    assert claims == [Claim(id="c1", text="from-provider")]
+    assert len(spy.calls) == 1

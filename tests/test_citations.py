@@ -20,10 +20,12 @@ from proov.citations import (
     _MAX_FETCH_BYTES,
     _MAX_FETCH_CHARS,
     _DEFAULT_CITATION_TIMEOUT,
+    _DEFAULT_MAX_SOURCES,
     _DEFAULT_USER_AGENT,
     _classify_retrievability,
     _fetch_source,
     _flag_for,
+    _resolve_max_sources,
     _resolve_timeout,
     _resolve_user_agent,
     _strip_html,
@@ -689,3 +691,146 @@ async def test_oversize_source_end_to_end_is_ok_not_fabricated():
         )
     assert result == [CitationCheck("https://big.example", False, False, "ok")]
     assert spy.calls == []  # no judge spend on the oversize body
+
+
+# ============================================================ Story 3.4: provided-source cap (deferred 2.4)
+
+
+def test_resolve_max_sources_hardening():
+    # Default 50; a valid >0 int honoured; non-int / ≤0 → default (a 0 cap would drop ALL).
+    assert _resolve_max_sources(None) == _DEFAULT_MAX_SOURCES
+    assert _resolve_max_sources("10") == 10
+    assert _resolve_max_sources("0") == _DEFAULT_MAX_SOURCES
+    assert _resolve_max_sources("-3") == _DEFAULT_MAX_SOURCES
+    assert _resolve_max_sources("nonsense") == _DEFAULT_MAX_SOURCES
+    assert _resolve_max_sources("3.5") == _DEFAULT_MAX_SOURCES  # non-int string → default
+
+
+async def test_provided_sources_capped_to_max_sources(monkeypatch):
+    # A buyer submitting more provided sources than the cap → at most `PROOV_MAX_SOURCES` are
+    # fetched AND judged (the paid-call amplification bound). First-seen order is preserved.
+    monkeypatch.setenv("PROOV_MAX_SOURCES", "3")
+    spy = _CitationJudgeSpy()
+    fetched: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        fetched.append(str(request.url))
+        return httpx.Response(200, text=_html("supporting text"))
+
+    sources = [{"url": f"https://s{i}.example"} for i in range(5)]
+    async with _mock_fetch_client(handler) as client:
+        result = await check_citations("out", sources, "quick", provider=spy, client=client)
+
+    assert len(fetched) == 3  # only the first cap sources are fetched (bounded outbound)
+    assert len(spy.calls) == 3  # only the first cap sources are judged (bounded paid calls)
+    assert [cc.source for cc in result] == [f"https://s{i}.example" for i in range(3)]
+
+
+async def test_source_cap_does_not_limit_deep_discovered(monkeypatch):
+    # The cap is on the PROVIDED (spend) surface only; Deep `discovered` appends are zero-cost
+    # (already-judged, no re-fetch/re-judge) and must be unaffected by the cap.
+    monkeypatch.setenv("PROOV_MAX_SOURCES", "1")
+    spy = _CitationJudgeSpy()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=_html("text"))
+
+    provided = [{"url": "https://p1.example"}, {"url": "https://p2.example"}]
+    discovered = [("https://d1.example", "supports"), ("https://d2.example", "neutral")]
+    async with _mock_fetch_client(handler) as client:
+        result = await check_citations(
+            "out", provided, "deep", provider=spy, client=client, discovered=discovered
+        )
+
+    provided_results = [cc for cc in result if cc.source.startswith("https://p")]
+    discovered_results = [cc for cc in result if cc.source.startswith("https://d")]
+    assert len(provided_results) == 1  # provided truncated to the cap
+    assert len(discovered_results) == 2  # discovered untouched by the cap
+
+
+async def test_source_cap_logs_truncation_warning(monkeypatch, caplog):
+    monkeypatch.setenv("PROOV_MAX_SOURCES", "2")
+    spy = _CitationJudgeSpy()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=_html("text"))
+
+    sources = [{"url": f"https://s{i}.example"} for i in range(5)]
+    async with _mock_fetch_client(handler) as client:
+        with caplog.at_level("WARNING"):
+            await check_citations("out", sources, "quick", provider=spy, client=client)
+
+    assert any("PROOV_MAX_SOURCES" in r.message for r in caplog.records)  # one warning, dropped count
+
+
+# ----------------------------- Story 3.4 code-review patch P1: per-order cost-budget source cap
+
+
+async def test_max_paid_sources_caps_the_paid_loop(monkeypatch):
+    # P1: the engine passes how many provided sources the REMAINING per-order budget can afford;
+    # check_citations truncates the paid fetch+judge loop to that bound so the citation check can
+    # never push the order past its cost ceiling. A high PROOV_MAX_SOURCES proves the BUDGET is the
+    # binding constraint here, not the amplification cap.
+    monkeypatch.setenv("PROOV_MAX_SOURCES", "50")
+    spy = _CitationJudgeSpy()
+    fetched: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        fetched.append(str(request.url))
+        return httpx.Response(200, text=_html("supporting text"))
+
+    sources = [{"url": f"https://s{i}.example"} for i in range(5)]
+    async with _mock_fetch_client(handler) as client:
+        result = await check_citations(
+            "out", sources, "quick", provider=spy, client=client, max_paid_sources=2
+        )
+
+    assert len(fetched) == 2  # only the budget-affordable sources are fetched (bounded outbound)
+    assert len(spy.calls) == 2  # only the budget-affordable sources are judged (bounded paid spend)
+    assert [cc.source for cc in result] == [f"https://s{i}.example" for i in range(2)]
+
+
+async def test_max_paid_sources_none_leaves_check_unbounded(monkeypatch):
+    # P1: max_paid_sources=None (the disabled-meter / $0 default path) imposes no budget cap — every
+    # provided source within PROOV_MAX_SOURCES is processed, byte-for-byte as before the patch.
+    monkeypatch.setenv("PROOV_MAX_SOURCES", "50")
+    spy = _CitationJudgeSpy()
+    fetched: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        fetched.append(str(request.url))
+        return httpx.Response(200, text=_html("supporting text"))
+
+    sources = [{"url": f"https://s{i}.example"} for i in range(4)]
+    async with _mock_fetch_client(handler) as client:
+        result = await check_citations(
+            "out", sources, "quick", provider=spy, client=client, max_paid_sources=None
+        )
+
+    assert len(fetched) == 4  # unbounded by budget
+    assert len(result) == 4
+
+
+async def test_max_paid_sources_does_not_limit_deep_discovered(monkeypatch, caplog):
+    # P1: the budget cap is on the PROVIDED (paid) surface only and logs one warning when it bites;
+    # Deep `discovered` appends are zero-cost (already-judged, no re-fetch/re-judge) and unaffected.
+    monkeypatch.setenv("PROOV_MAX_SOURCES", "50")
+    spy = _CitationJudgeSpy()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=_html("text"))
+
+    provided = [{"url": f"https://p{i}.example"} for i in range(3)]
+    discovered = [("https://d1.example", "supports"), ("https://d2.example", "neutral")]
+    async with _mock_fetch_client(handler) as client:
+        with caplog.at_level("WARNING"):
+            result = await check_citations(
+                "out", provided, "deep", provider=spy, client=client,
+                discovered=discovered, max_paid_sources=1,
+            )
+
+    provided_results = [cc for cc in result if cc.source.startswith("https://p")]
+    discovered_results = [cc for cc in result if cc.source.startswith("https://d")]
+    assert len(provided_results) == 1  # provided truncated to the affordable budget (1 paid source)
+    assert len(discovered_results) == 2  # discovered untouched by the budget cap
+    assert any("cost ceiling" in r.message for r in caplog.records)  # one budget-cap warning

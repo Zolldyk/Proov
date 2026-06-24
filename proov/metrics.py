@@ -174,8 +174,15 @@ def estimate_order_cost(tier: str) -> float:
     Wikipedia free quotas → $0 marginal, NFR1), overridable via `PROOV_DEEP_COST_USD` for
     `"deep"` / `PROOV_QUICK_COST_USD` otherwise for when a tier moves to paid quota. A
     non-numeric override falls back to `0.0` (the defensive parse idiom of
-    `cache._resolve_ttl_seconds`). This makes cost/order *visible* today and leaves a clean seam
-    for Story 3.4 to replace the estimate with a measured per-order counter (+ a ceiling).
+    `cache._resolve_ttl_seconds`).
+
+    This is the **recorded/displayed** per-order figure on the ledger + dashboard. As of
+    Story 3.4 the *enforcement* twin exists — `estimate_claim_cost(tier)` drives the engine's
+    `PROOV_MAX_ORDER_COST_USD` per-order cost ceiling (the spend-twin of the SLA deadline) —
+    but the two remain independent documented constants the operator keeps consistent. The full
+    unification into ONE measured per-order counter feeding BOTH the recorded figure and the
+    ceiling is Story 3.4 Open Question 2 (it would need `Report` to carry a non-hashed measured
+    cost; out of scope here).
     """
     var = "PROOV_DEEP_COST_USD" if tier == "deep" else "PROOV_QUICK_COST_USD"
     raw = os.environ.get(var, "0.0")
@@ -184,6 +191,30 @@ def estimate_order_cost(tier: str) -> float:
     except (TypeError, ValueError):
         return 0.0
     # Reject non-finite (inf/nan) overrides too — a garbage cost must never poison cost/order.
+    if value != value or value in (float("inf"), float("-inf")):
+        return 0.0
+    return value
+
+
+def estimate_claim_cost(tier: str) -> float:
+    """The documented per-claim marginal cost for `tier` — the cost ceiling's meter (Story 3.4).
+
+    The per-claim spend estimate the engine's `PROOV_MAX_ORDER_COST_USD` ceiling accumulates
+    against (one `estimate_claim_cost(tier)` per judged claim slice). Default `0.0` on the
+    free-tier stack (→ the ceiling meter is inert, the $0 path unchanged, NFR1), overridable
+    via `PROOV_DEEP_CLAIM_COST_USD` for `"deep"` / `PROOV_QUICK_CLAIM_COST_USD` otherwise for
+    when a tier moves to paid quota. **Identical defensive shape to `estimate_order_cost`:** a
+    non-numeric or non-finite (`inf`/`nan`) value falls back to `0.0` so garbage can never
+    poison the meter (which would spuriously stop an order early). The per-order
+    `estimate_order_cost` remains the recorded/displayed figure; see its docstring + OQ2.
+    """
+    var = "PROOV_DEEP_CLAIM_COST_USD" if tier == "deep" else "PROOV_QUICK_CLAIM_COST_USD"
+    raw = os.environ.get(var, "0.0")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    # Reject non-finite (inf/nan) overrides too — garbage must never poison the cost meter.
     if value != value or value in (float("inf"), float("-inf")):
         return 0.0
     return value

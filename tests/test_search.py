@@ -591,3 +591,24 @@ def test_resolve_timeout_rejects_non_finite_and_nonpositive():
     assert _resolve_timeout("garbage") == 10.0
     assert _resolve_timeout(None) == 10.0
     assert _resolve_timeout("7.5") == 7.5
+
+
+# ============================================================ Story 3.4: search quota (429) fall-through
+
+
+async def test_retrieve_routes_past_tavily_429_to_next_provider():
+    # AC5: a Tavily 429 (quota) → raise_for_status → httpx.HTTPStatusError → wrapped SearchError →
+    # the chain falls through to the next provider, and the order STILL gets evidence. Proov does
+    # NOT reimplement search fallback (the chain already owns it); this pins the `[Tavily 429]→
+    # [Wikipedia]` contract (the search twin of the LLM `[Gemini 429]→[Stub]` chain).
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": "rate limited"})
+
+    tavily = _mock_tavily(handler)
+    canned = [Evidence(source="https://fallback/x", title="X", snippet="fallback evidence")]
+    fallback = _SpyProvider(canned)
+
+    ev = await retrieve_evidence("q", "quick", providers=[tavily, fallback])
+    assert ev == canned  # the 429'd Tavily routed through to the keyless fallback
+    assert len(fallback.calls) == 1  # fallback WAS reached after the 429
+    assert fallback.calls[0][0] == "q"

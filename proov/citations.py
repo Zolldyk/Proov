@@ -58,6 +58,10 @@ _MAX_FETCH_BYTES = 1_000_000
 _MAX_CLAIM_CHARS = 2000
 # Per-source fetch timeout default; an infinite timeout would defeat the SLA (NFR2).
 _DEFAULT_CITATION_TIMEOUT = 10.0
+# Story 3.4: cap the number of buyer-PROVIDED sources fetched+judged, closing the deferred-2.4
+# paid-call amplification hole (a giant `sources` array → unbounded paid judge calls/fetches).
+# Default 50 — generous vs typical buyer use + the 20/50 claim caps, still bounds spend.
+_DEFAULT_MAX_SOURCES = 50
 
 # Three-way retrievability classification (Story 3.1 precision fix). `retrievable` (the source
 # resolved, status < 400), `absent` (a DEFINITIVE 404/410 — the source provably does not
@@ -97,6 +101,26 @@ def _resolve_timeout(raw: str | None) -> float:
         return _DEFAULT_CITATION_TIMEOUT
     if not math.isfinite(value) or value <= 0:
         return _DEFAULT_CITATION_TIMEOUT
+    return value
+
+
+def _resolve_max_sources(raw: str | None = None) -> int:
+    """Resolve `PROOV_MAX_SOURCES`, tolerating garbage by falling back to the default (Story 3.4).
+
+    The buyer-provided-source cap that bounds paid-call amplification (deferred 2.4). Mirrors the
+    `_resolve_*` hardening idiom: a missing / non-int / ≤0 value → `_DEFAULT_MAX_SOURCES` (a
+    zero/negative cap would silently drop ALL provided sources, the opposite of intended). Returns
+    a positive `int`.
+    """
+    raw = raw if raw is not None else os.environ.get("PROOV_MAX_SOURCES")
+    if raw is None:
+        return _DEFAULT_MAX_SOURCES
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_SOURCES
+    if value <= 0:
+        return _DEFAULT_MAX_SOURCES
     return value
 
 
@@ -298,6 +322,7 @@ async def check_citations(
     options: dict | None = None,
     timeout: float | None = None,
     discovered: list[tuple[str, Stance]] | None = None,
+    max_paid_sources: int | None = None,
 ) -> list[CitationCheck]:
     """Check buyer-provided `sources` (+ Deep discovered), flag each, and NEVER raise out.
 
@@ -349,6 +374,35 @@ async def check_citations(
             raw_title = item.get("title")
             title = raw_title.strip() if isinstance(raw_title, str) else ""
             normalised.append((url, title))
+
+        # Story 3.4 source cap: truncate the deduped provided list to `PROOV_MAX_SOURCES` BEFORE
+        # the paid fetch+judge loop, so a buyer cannot amplify outbound fetches / paid judge calls
+        # by submitting an arbitrarily long `sources` array (deferred-2.4). Provided-only — the
+        # Deep `discovered` appends below are zero-cost (already judged, no re-fetch/re-judge).
+        max_sources = _resolve_max_sources()
+        if len(normalised) > max_sources:
+            logger.warning(
+                "provided sources (%d) exceed PROOV_MAX_SOURCES (%d); dropping %d → capping",
+                len(normalised),
+                max_sources,
+                len(normalised) - max_sources,
+            )
+            normalised = normalised[:max_sources]
+
+        # Story 3.4 cost ceiling: the engine passes how many provided sources the REMAINING
+        # per-order budget can afford (one paid judge call per retrievable source). Cap the paid
+        # loop conservatively so the citation check can never push the order past its ceiling — the
+        # surplus provided sources are dropped (degrade, mirroring the SLA early-stop → partial).
+        # `None` (disabled meter) leaves the list untouched.
+        if max_paid_sources is not None and len(normalised) > max_paid_sources:
+            logger.warning(
+                "provided sources (%d) exceed the remaining per-order cost budget (%d affordable); "
+                "dropping %d to honor the cost ceiling",
+                len(normalised),
+                max_paid_sources,
+                len(normalised) - max_paid_sources,
+            )
+            normalised = normalised[:max_paid_sources]
 
         if normalised:
             # Caller `timeout` overrides env (mirror `retrieve_evidence`'s caller-timeout).

@@ -38,7 +38,8 @@ import math
 import os
 
 from .citations import check_citations
-from .llm import LLMError, extract_claims, get_llm_provider, judge_claim
+from .llm import LLMError, _resolve_deep_passes, default_llm_chain, extract_claims, judge_claim
+from .metrics import estimate_claim_cost
 from .search import retrieve_evidence
 from .types import CitationCheck, ClaimFinding, Report, Stance, Tier
 from .verdict import aggregate_verdict
@@ -74,6 +75,27 @@ def _resolve_sla_seconds(tier: Tier, raw: str | None = None) -> float:
         return default
     if not math.isfinite(value) or value <= 0:
         return default
+    return value
+
+
+def _resolve_max_order_cost(raw: str | None = None) -> float:
+    """Resolve the per-order cost ceiling `PROOV_MAX_ORDER_COST_USD` (Story 3.4, NFR1).
+
+    The spend-twin of `_resolve_sla_seconds`: a missing / non-numeric / non-finite
+    (`inf`/`nan`) / negative value → the default **`0.0`**, which is also the **disabled
+    sentinel** — a `0.0` ceiling means the engine takes ZERO cost branches, so the default $0
+    free-tier path is byte-for-byte unchanged (unlike the SLA resolver, `0.0` is valid here, it
+    just disables the meter). Returns a finite float `>= 0`.
+    """
+    raw = raw if raw is not None else os.environ.get("PROOV_MAX_ORDER_COST_USD")
+    if raw is None:
+        return 0.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(value) or value < 0:
+        return 0.0
     return value
 
 
@@ -146,15 +168,47 @@ async def verify(input: dict, tier: Tier, *, options: dict | None = None) -> Rep
     # judging; bounded concurrency lives in the provider (Story 3.3 worker-pool).
     deadline = _now() + _resolve_sla_seconds(tier)
 
-    # Resolve the LLM provider ONCE so the stamped model is the one that judged (FR14).
-    # A config error (missing key / unknown provider) must not crash a paid order — degrade
-    # to no provider (extraction will then fail → zero claims → honest partial).
+    # Resolve the LLM provider CHAIN ONCE (Story 3.4) so a Gemini 429/quota signal routes to the
+    # $0 Stub tail instead of dropping the order's claims, and pass the SAME chain into both
+    # extraction and judgment. The stamped `model` is the chain HEAD — the configured/advertised
+    # primary (e.g. "gemini-2.5-flash"); a quota fallback to the Stub tail is NOT reflected in the
+    # single `model` field (Open Question 1, noted in Dev Agent Record). A config error (a forced
+    # PROOV_LLM_PROVIDER that's unknown) must not crash a paid order — degrade to an empty chain
+    # (→ extraction raises LLMError → zero claims → honest partial; model "unknown-model").
     try:
-        provider = get_llm_provider()
+        chain = default_llm_chain()
     except LLMError as exc:
-        logger.warning("LLM provider unavailable; verification will degrade: %r", exc)
-        provider = None
-    model = getattr(provider, "model", "unknown-model")
+        logger.warning("LLM provider chain unavailable; verification will degrade: %r", exc)
+        chain = []
+    model = getattr(chain[0], "model", "unknown-model") if chain else "unknown-model"
+
+    # Per-order cost ceiling (Story 3.4) — the spend-twin of the SLA deadline above. Resolve the
+    # ceiling + per-claim marginal cost ONCE; `spent` accumulates as claims are judged. With the
+    # default ceiling `0.0` the meter is DISABLED: every `ceiling > 0` branch below is skipped, so
+    # the $0 free-tier path is byte-for-byte unchanged (NFR1). When set, the loop stops early →
+    # honest `partial` before the projected order cost would breach the ceiling (degrade, don't
+    # overspend — NFR3).
+    ceiling = _resolve_max_order_cost()
+    # A Deep claim is judged by `_resolve_deep_passes()` sequential LLM passes (Story 2.7), so its
+    # true marginal cost is the per-pass seam cost × the pass count — metering one pass would
+    # undercount Deep spend by ~the pass count and let the ceiling be silently breached. Quick is
+    # single-pass (factor 1). Inert at the default 0.0 claim cost.
+    claim_cost = estimate_claim_cost(tier)
+    if tier == "deep":
+        claim_cost *= _resolve_deep_passes()
+    spent = 0.0
+
+    # A ceiling smaller than a single claim's marginal cost can never judge even one claim — the
+    # loop breaks at index 0 and the order returns an empty `partial` indistinguishable from a real
+    # degrade. Surface that misconfiguration once so the operator isn't blind to it.
+    if ceiling > 0 and claim_cost > 0 and claim_cost > ceiling:
+        logger.warning(
+            "%s per-claim cost $%.4f exceeds the per-order ceiling $%.4f — no claim can be judged "
+            "within budget; every order will return an empty partial",
+            tier,
+            claim_cost,
+            ceiling,
+        )
 
     # (a) Extraction is the ONE entrypoint that raises out — wrap only this. Degrade an
     # extraction failure to zero claims; the citation+aggregate path still runs (→ partial/
@@ -164,7 +218,7 @@ async def verify(input: dict, tier: Tier, *, options: dict | None = None) -> Rep
         claims = await extract_claims(
             output_text,
             tier,
-            provider=provider,
+            providers=chain,
             options=opts,
             explicit_claims=explicit_claims,
         )
@@ -184,6 +238,21 @@ async def verify(input: dict, tier: Tier, *, options: dict | None = None) -> Rep
     # propagates (NFR3 — cancellation must never be swallowed).
     findings: list[ClaimFinding] = []
     for index, claim in enumerate(claims):
+        # Cost ceiling (Story 3.4): the spend-twin of the SLA `remaining` check below. If the
+        # next claim's marginal cost would push the order past the ceiling, stop early and
+        # aggregate what was judged → honest `partial` (never overspend). Inert when `ceiling`
+        # is the default 0.0 (the $0 path takes this branch zero times).
+        if ceiling > 0 and spent + claim_cost > ceiling:
+            logger.warning(
+                "%s cost ceiling $%.4f would be breached, stopping after %d/%d claims "
+                "(spent $%.4f) → partial",
+                tier,
+                ceiling,
+                index,
+                len(claims),
+                spent,
+            )
+            break
         remaining = deadline - _now()
         if remaining <= 0:
             logger.warning(
@@ -207,7 +276,7 @@ async def verify(input: dict, tier: Tier, *, options: dict | None = None) -> Rep
                 )
                 break
             judgment = await asyncio.wait_for(
-                judge_claim(claim, evidence, tier, provider=provider, options=opts),
+                judge_claim(claim, evidence, tier, providers=chain, options=opts),
                 remaining,
             )
         except asyncio.TimeoutError:
@@ -219,6 +288,8 @@ async def verify(input: dict, tier: Tier, *, options: dict | None = None) -> Rep
             )
             break
         findings.append(ClaimFinding(claim=claim, judgment=judgment))
+        # Meter the completed slice (inert at the default 0.0 claim cost).
+        spent += claim_cost
 
     # (c) Citation check over the buyer-provided sources (provided-source order preserved).
     # Deep ALSO covers DISCOVERED sources (architecture §4 "provided + discovered"): the unique
@@ -232,13 +303,32 @@ async def verify(input: dict, tier: Tier, *, options: dict | None = None) -> Rep
     # (`remaining <= 0`) the call is skipped; on `asyncio.TimeoutError` it degrades to no
     # citations. Either way the pure/total `aggregate_verdict` still runs → an honest verdict.
     # The cheap discovered-source collection is pure (no await) and runs before the bound.
+    # Citation source judging is paid LLM work, so the cost ceiling gates it too (Story 3.4):
+    # if the per-order budget is already spent, skip the check → citations degrade to [] (same
+    # honest degrade as the SLA-exhausted branch). Inert at the default 0.0 ceiling.
     citations: list[CitationCheck] = []
     remaining = deadline - _now()
     if remaining <= 0:
         logger.warning(
             "%s SLA budget exhausted before citation check → citations degraded to []", tier
         )
+    elif ceiling > 0 and spent >= ceiling:
+        logger.warning(
+            "%s cost ceiling $%.4f reached (spent $%.4f) before citation check → "
+            "citations degraded to []",
+            tier,
+            ceiling,
+            spent,
+        )
     else:
+        # Story 3.4: bound the citation check's paid judge calls by the REMAINING per-order budget.
+        # Each retrievable provided source costs up to one `claim_cost` judge call; cap conservatively
+        # (count every provided source as paid) so the citation check — the order's largest paid
+        # surface — can never push spend past the ceiling. `None` when the meter is disabled (default
+        # $0 path) or the per-claim cost is unmetered (0.0), leaving the check unbounded as before.
+        max_paid_sources = None
+        if ceiling > 0 and claim_cost > 0:
+            max_paid_sources = max(0, int((ceiling - spent) / claim_cost))
         try:
             if tier == "deep":
                 provided_urls = {
@@ -260,7 +350,12 @@ async def verify(input: dict, tier: Tier, *, options: dict | None = None) -> Rep
                 citations = list(
                     await asyncio.wait_for(
                         check_citations(
-                            output_text, sources, tier, options=opts, discovered=discovered
+                            output_text,
+                            sources,
+                            tier,
+                            options=opts,
+                            discovered=discovered,
+                            max_paid_sources=max_paid_sources,
                         ),
                         remaining,
                     )
@@ -268,7 +363,13 @@ async def verify(input: dict, tier: Tier, *, options: dict | None = None) -> Rep
             else:
                 citations = list(
                     await asyncio.wait_for(
-                        check_citations(output_text, sources, tier, options=opts),
+                        check_citations(
+                            output_text,
+                            sources,
+                            tier,
+                            options=opts,
+                            max_paid_sources=max_paid_sources,
+                        ),
                         remaining,
                     )
                 )

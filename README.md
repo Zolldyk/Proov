@@ -34,6 +34,10 @@ instrumented**: the provider mirrors every terminal order into a best-effort SQL
 **reliability-hardened**: a worker-pool bounds concurrent verifications within free-tier RPM,
 per-claim/per-order timeouts hold the SLA at slice granularity (degrading to an honest `partial`),
 and graceful shutdown drains in-flight settlements — so the completion rate holds under load.
+Finally, **cost guardrails enforce the $0-marginal promise**: quota-aware fallback chains route a
+free-tier `429` to a free provider (`[Gemini 429]→[Stub]`, `[Tavily 429]→[Wikipedia]`), a
+configurable per-order cost ceiling stops spend early (degrading to an honest `partial`), and a
+buyer-source cap bounds paid-call amplification — all disabled by default so the stack stays $0.
 
 ## How it works
 
@@ -473,6 +477,37 @@ byte-for-byte unchanged, and the guiding rule is the carried **degrade, don't dr
 
 All of this is proven **offline / $0**: injected gates and clocks, `httpx.MockTransport`, and SQLite
 `:memory:` — no real sockets, no wall-clock sleeps, no API spend.
+
+### Cost guardrails (Story 3.4)
+
+The whole business model rests on **NFR1 — $0 marginal per order, no tier runs at a loss**. Story 3.2
+made cost/order *visible*; 3.4 *enforces* it, so a verifier can't quietly burn paid quota (or let a
+buyer amplify it) and die the moment the free credits run out. Two guardrails plus a source cap, each
+a *fallback route* or a *spend bound* whose default leaves the $0 path **byte-for-byte unchanged**:
+
+- **Quota-aware fallback chains — route to a free provider when a quota is hit.** Both the LLM and
+  search sides are now ordered **chains** that fall through on a `429`/quota signal:
+  **`[Gemini 429] → [Stub]`** for the LLM (the new `default_llm_chain` ends in the always-available,
+  keyless, offline `$0` `StubLLMProvider` tail) and **`[Tavily 429] → [Wikipedia]`** for search (the
+  pre-existing `default_search_chain`, which already fell through — 3.4 verifies + tests it, doesn't
+  reinvent it). A Gemini rate-limit/quota response (`LLMQuotaError`) now routes the call to the next
+  provider instead of dropping the order's claims — **degrade to the free provider, don't drop**
+  (NFR3). Cerebras / Groq / Ollama (architecture §6) are documented **pluggable slots**: a future
+  story adds a provider class + a chain entry with **no engine change** (the point of the Protocol).
+- **A per-order cost ceiling — never spend past a configured bound.** `PROOV_MAX_ORDER_COST_USD` is
+  the *spend-twin of the SLA deadline*: the per-claim loop accumulates each claim's estimated
+  marginal cost (`estimate_claim_cost(tier)`) and, before a slice that would breach the ceiling,
+  **stops early and aggregates what was judged → an honest `partial`** (and skips the paid citation
+  check). The default ceiling **`0.0` disables the meter entirely** — every cost branch is inert, so
+  the free-tier path is unchanged; it only bites once a tier carries a real per-call price.
+- **A buyer-source cap closes the paid-call amplification hole.** `check_citations` truncates the
+  buyer-**provided** `sources` list to `PROOV_MAX_SOURCES` (default **50**) before the fetch+judge
+  loop, so a giant `sources` array can't multiply outbound fetches / paid judge calls. Deep
+  *discovered* sources are unaffected (they're already-judged, zero-cost).
+
+Cost is **operator-internal** — it never enters the `Report`, the deliverable body, or the
+`report_hash`-ed receipt. Proven **offline / $0**: injected providers, fake `429`s
+(`httpx.MockTransport`), and per-test cost constants — no real network, quota, or spend.
 
 ## Input/output contract
 
