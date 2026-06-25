@@ -113,6 +113,130 @@ already connected with this key"* and exits non-zero. Reconnect and heartbeat ar
 (30s ping, 60s pong-timeout, exponential backoff); the adapter keeps the process alive,
 surfaces the fatal duplicate-key case, and shuts down gracefully on `SIGINT`/`SIGTERM`.
 
+## Operations — running Proov 24/7 on the always-on host
+
+`python -m proov` in a terminal works for a demo, but the moment you log out the shell dies
+and Proov goes offline. CROO is **WebSocket-only**: `online` means a live process is holding
+the socket and answering a 30 s heartbeat. To stay hireable around the clock you run Proov as
+a **managed service** under a supervisor that owns start/restart/boot — and nothing more,
+because the runtime is already deploy-shaped (it exits 0 on `SIGTERM`, exits 1 on a fatal
+`1008`, drains in-flight settlements for `PROOV_SHUTDOWN_DRAIN_SECONDS` on shutdown, and the
+SDK owns reconnect + heartbeat). The artifacts for this live in [`deploy/`](deploy/).
+
+> **One key, one process.** A CROO API key may have **exactly one** live connection. A second
+> `python -m proov` on the same `CROO_API_KEY` — a stray local run, or Oracle **and** Koyeb up
+> at once — is rejected with WS code **`1008`** and exits 1. Never run two providers on one key.
+
+### 1. Provision the host (Oracle Cloud Always Free VM)
+
+Proov is a single async process with **hosted** LLM/search, so its host load is near-zero —
+any Always-Free shape is ample.
+
+- **A1 (ARM):** the Always-Free cap **dropped to 2 OCPU / 12 GB total in June 2026** (it was
+  4/24 in older guides). Proov needs far less, so a small A1 is plenty.
+- **A1 "Out of Capacity" is common.** If you can't launch an A1, use the x86
+  `VM.Standard.E2.1.Micro` Always-Free shape (no capacity contention), or use the
+  [Koyeb fallback](#6-fallback-koyeb-worker). **US East (Ashburn)** / **US West (Phoenix)**
+  have the most consistent A1 capacity; off-peak creation helps.
+- Ubuntu/Oracle Linux with `python3` ≥ 3.10 and `git`. Open **no** inbound ports — Proov only
+  makes an **outbound** WebSocket connection.
+
+### 2. Install
+
+Copy the checkout to a fixed path, build a venv, install, and place the secrets file **off the
+repo tree**. The helper [`deploy/install.sh`](deploy/install.sh) does steps a–d idempotently
+(re-run it to deploy a new version); the manual equivalent:
+
+```bash
+# a) code at a fixed path + a dedicated non-root user
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin proov
+sudo install -d -o proov -g proov /opt/proov
+sudo cp -a . /opt/proov/ && sudo rm -rf /opt/proov/.git /opt/proov/.venv
+
+# b) venv + install (no new runtime dep beyond pyproject.toml)
+sudo python3 -m venv /opt/proov/.venv
+sudo /opt/proov/.venv/bin/pip install /opt/proov
+sudo chown -R proov:proov /opt/proov
+
+# c) secrets EnvironmentFile — 0600, root-owned, OUTSIDE the repo, NEVER committed
+sudo install -d -m 700 /etc/proov
+sudo cp deploy/proov.env.example /etc/proov/proov.env
+sudo chmod 600 /etc/proov/proov.env && sudo chown root:root /etc/proov/proov.env
+sudo editor /etc/proov/proov.env          # fill in CROO_API_KEY etc.
+
+# d) install the unit + start on boot
+sudo cp deploy/proov.service /etc/systemd/system/proov.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now proov
+```
+
+The secrets file is **gitignored and host-only** — only `deploy/proov.env.example` (the
+template, no real keys) is tracked. The unit ships with placeholder paths (`/opt/proov`,
+`User=proov`, `/etc/proov/proov.env`); reconcile them with your host before `daemon-reload`.
+
+### 3. Manage (start / stop / logs / update)
+
+```bash
+sudo systemctl start proov        # start
+sudo systemctl stop proov         # graceful stop (SIGTERM → drain → exit 0; stays stopped)
+sudo systemctl restart proov      # restart
+systemctl status proov            # state + recent log lines
+systemctl is-enabled proov        # -> enabled  (starts on boot)
+journalctl -u proov -f            # follow logs (connect/heartbeat; 1008 guidance on collision)
+```
+
+**Update to a new version:** pull/copy the new code into `/opt/proov`, reinstall, restart —
+or just re-run `sudo ./deploy/install.sh`:
+
+```bash
+sudo /opt/proov/.venv/bin/pip install /opt/proov   # after refreshing the code
+sudo systemctl restart proov
+```
+
+### 4. How systemd maps to Proov's exit codes
+
+| Event | Process | systemd action |
+|---|---|---|
+| `systemctl stop` | SIGTERM → drain → **exit 0** | records an operator stop → **no restart** |
+| host reboot | enabled unit auto-starts | reconnects unattended |
+| `kill -9 <pid>` | dies uncleanly | `Restart=always` → **restarts** → reconnects |
+| bad key / `1008` | **exit 1** every start | `StartLimitBurst` trips → unit `failed` after ~5 tries (no tight CROO loop) |
+
+`TimeoutStopSec=40` exceeds the 25 s drain so a stop during a live `deliver_order` settlement
+finishes before SIGKILL. The crash-loop guard makes a duplicate-key collision fail **loudly**
+in `journalctl` instead of hammering CROO.
+
+### 5. One key, one process
+
+Re-stated because it is the most common foot-gun: **do not** leave a local `python -m proov`
+running against the same key as the host, and **do not** run Oracle and Koyeb simultaneously.
+The collision exits the new process 1 with `1008`; `journalctl -u proov` logs *"another
+provider is already connected with this key"*.
+
+### 6. Fallback: Koyeb worker
+
+If Oracle A1 is "Out of Capacity" and you'd rather not use the x86 micro shape, deploy the
+root [`Dockerfile`](Dockerfile) to **Koyeb as a *Worker* service** (not Web — there is no port
+or health endpoint; Proov's only surface is the outbound WebSocket). Set the same env vars
+(`CROO_API_URL`, `CROO_WS_URL`, `CROO_API_KEY`, optional `GEMINI_API_KEY` / `TAVILY_API_KEY`)
+in the Koyeb dashboard — never bake secrets into the image. Koyeb's supervisor restarts the
+worker on crash, the same role systemd plays on the VM. Keep the **one key, one process** rule.
+
+### 7. Verification checklist (run on the host)
+
+These checks need the **provisioned host and the live CROO socket**, so they are operator
+runtime actions — tick them off on the VM:
+
+- [ ] **Online, no terminal held:** `systemctl status proov` is `active (running)`;
+      `journalctl -u proov -f` shows `provider online: listening for events`; **close the SSH
+      session**, reconnect, and confirm Proov is still `online` in the CROO Dashboard. *(AC2)*
+- [ ] **Survives reboot:** `systemctl is-enabled proov` → `enabled`; `sudo reboot`; after the
+      host comes back, Proov returns to `online` unattended. *(AC3)*
+- [ ] **Survives `kill -9`:** `sudo kill -9 $(systemctl show -p MainPID --value proov)`;
+      systemd restarts it (`Restart=always`) and it reconnects. *(AC4)*
+- [ ] **No duplicate-key crash-loop:** a genuine bad key / `1008` lands the unit in `failed`
+      after ~5 rapid restarts (`systemctl status proov` → `failed`), not a tight loop. *(AC4)*
+
 ## Order lifecycle
 
 The provider drives a full CAP transaction end to end:

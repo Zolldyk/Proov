@@ -1,0 +1,62 @@
+# Proov — CAP provider, run unattended on the always-on host as a managed service.
+#
+# This unit wraps `python -m proov` under systemd so Proov stays `online` and hireable
+# 24/7 without a terminal session held open. The runtime is ALREADY supervisor-shaped:
+#   - `python -m proov` exits 0 on a clean SIGINT/SIGTERM shutdown, 1 on a config error
+#     or a fatal provider error (the duplicate-key `1008`).            [proov/__main__.py]
+#   - the provider installs SIGINT/SIGTERM handlers and drains in-flight settlements up to
+#     PROOV_SHUTDOWN_DRAIN_SECONDS (default 25 s) before closing.       [proov/provider.py]
+#   - the SDK owns reconnect + heartbeat (30 s ping / 60 s pong-timeout / capped backoff).
+# So this unit only supervises/restarts/boots the process — it does NOT re-implement any of
+# the above. Do not add a daemonizer, a PID file, a reconnect loop, or a healthcheck server.
+#
+# PLACEHOLDERS the operator MUST reconcile (see README → "Operations — running Proov 24/7"):
+#   /opt/proov              install dir (also the SQLite state dir: proov_cache.db / proov_ledger.db)
+#   /opt/proov/.venv        virtualenv created on the host
+#   /etc/proov/proov.env    secrets EnvironmentFile — 0600, root-owned, OFF the repo tree, NEVER committed
+#   User=proov              dedicated non-root service account
+# After editing paths: `sudo systemctl daemon-reload && sudo systemctl enable --now proov`.
+
+[Unit]
+Description=Proov — CAP provider (always-on)
+# Don't race a not-yet-ready network: the WebSocket connect needs DNS + routing up.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=proov
+WorkingDirectory=/opt/proov
+# Authoritative secrets/config. systemd EnvironmentFile is literal KEY=value (no `export`,
+# no shell quote-stripping). The provider's own .env loader does NOT overwrite vars already
+# in the environment, so this file wins and a stray .env in the deploy dir is unnecessary.
+EnvironmentFile=/etc/proov/proov.env
+# Module entrypoint — there is no console-script in pyproject.toml; use the venv python + -m.
+ExecStart=/opt/proov/.venv/bin/python -m proov
+
+# --- Supervision (ACs 2/3/4) ---
+Restart=always
+RestartSec=5
+# The provider's graceful drain is wired to SIGTERM; make the stop signal explicit.
+KillSignal=SIGTERM
+# Must EXCEED PROOV_SHUTDOWN_DRAIN_SECONDS (default 25 s) so a `systemctl stop` during a live
+# on-chain settlement lets the drain finish before systemd escalates to SIGKILL. 40 s = margin.
+TimeoutStopSec=40
+# Crash-loop guard: a genuine fatal — bad key, or a `1008` "key already has an active
+# connection" collision — exits 1 on EVERY start. Without this, Restart=always would hammer
+# CROO in a tight reconnect loop. Instead, >5 starts within 300 s lands the unit in `failed`,
+# surfacing the duplicate-key problem loudly. `journalctl -u proov` shows the 1008 guidance.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# --- Light hardening (does not affect the outbound WebSocket client) ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# ProtectSystem=strict makes the filesystem read-only; the SQLite cache/ledger are written
+# in WorkingDirectory, so that path must be writable.   [proov/cache.py, proov/ledger.py]
+ReadWritePaths=/opt/proov
+
+[Install]
+WantedBy=multi-user.target
