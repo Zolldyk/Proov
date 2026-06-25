@@ -22,6 +22,13 @@ Description=Proov — CAP provider (always-on)
 # Don't race a not-yet-ready network: the WebSocket connect needs DNS + routing up.
 After=network-online.target
 Wants=network-online.target
+# Crash-loop guard: a genuine fatal — bad key, or a `1008` "key already has an active
+# connection" collision — exits 1 on EVERY start. Without this, Restart=always would hammer
+# CROO in a tight reconnect loop. Instead, >5 starts within 300 s lands the unit in `failed`,
+# surfacing the duplicate-key problem loudly. `journalctl -u proov` shows the 1008 guidance.
+# (These are [Unit] directives in modern systemd — NOT [Service].)
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -42,12 +49,6 @@ KillSignal=SIGTERM
 # Must EXCEED PROOV_SHUTDOWN_DRAIN_SECONDS (default 25 s) so a `systemctl stop` during a live
 # on-chain settlement lets the drain finish before systemd escalates to SIGKILL. 40 s = margin.
 TimeoutStopSec=40
-# Crash-loop guard: a genuine fatal — bad key, or a `1008` "key already has an active
-# connection" collision — exits 1 on EVERY start. Without this, Restart=always would hammer
-# CROO in a tight reconnect loop. Instead, >5 starts within 300 s lands the unit in `failed`,
-# surfacing the duplicate-key problem loudly. `journalctl -u proov` shows the 1008 guidance.
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 # --- Light hardening (does not affect the outbound WebSocket client) ---
 NoNewPrivileges=true
